@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands
 import json
 
-TOKEN = "YOUR_TOKEN"
+import os
+TOKEN = os.getenv("TOKEN")
 
 GUILD_ID = 1464381836099584235
 
