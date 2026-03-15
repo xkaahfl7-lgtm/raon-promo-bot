@@ -4,6 +4,8 @@ import json
 import os
 
 TOKEN = os.getenv("TOKEN")
+intents = discord.Intents.default()
+intents.members = True
 
 GUILD_ID = 1464381836099584235
 
