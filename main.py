@@ -21,6 +21,7 @@ KST = ZoneInfo("Asia/Seoul")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -29,193 +30,285 @@ def now():
     return datetime.now(KST)
 
 
-def get_month_start():
-    dt = now()
+def get_month_start(dt=None):
+    if dt is None:
+        dt = now()
     return date(dt.year, dt.month, 1)
 
 
 def get_month_end(month_start):
-    last = calendar.monthrange(month_start.year, month_start.month)[1]
-    return date(month_start.year, month_start.month, last)
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+    return date(month_start.year, month_start.month, last_day)
+
+
+def get_next_month_start(month_start):
+    if month_start.month == 12:
+        return date(month_start.year + 1, 1, 1)
+    return date(month_start.year, month_start.month + 1, 1)
 
 
 def month_label(month_start):
-    end = get_month_end(month_start)
-    return f"{month_start.month:02d}월 {month_start.day:02d}일 ~ {end.month:02d}월 {end.day:02d}일 기록현황"
+    month_end = get_month_end(month_start)
+    return f"{month_start.month:02d}월 {month_start.day:02d}일 ~ {month_end.month:02d}월 {month_end.day:02d}일 기록현황"
 
 
-def load():
+def default_data():
+    return {
+        "users": {},
+        "rank_message_id": None,
+        "month_start": str(get_month_start()),
+        "last_finalized_month": None
+    }
+
+
+def load_data():
     if not os.path.exists(DATA_FILE):
-        return {
-            "users": {},
-            "rank_message": None,
-            "month_start": str(get_month_start())
-        }
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
+        return default_data()
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default_data()
 
 
-def save(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
 
-async def update_board(guild):
-    data = load()
-    users = data["users"]
+async def send_log(text):
+    channel = bot.get_channel(LOG_CHANNEL)
+    if channel:
+        try:
+            await channel.send(text)
+        except Exception:
+            pass
 
-    rank_channel = bot.get_channel(RANK_CHANNEL)
 
+def get_name(guild, user_id, fallback="Unknown"):
+    member = guild.get_member(int(user_id))
+    if member:
+        return member.display_name
+    return fallback
+
+
+def build_board_text(guild, data):
     month_start = date.fromisoformat(data["month_start"])
     label = month_label(month_start)
 
-    sorted_users = sorted(
-        users.items(),
-        key=lambda x: x[1]["count"],
-        reverse=True
-    )
+    users = data["users"]
+    sorted_users = sorted(users.items(), key=lambda x: x[1]["count"], reverse=True)
 
     lines = [f"🏆 {label}", ""]
 
     if not sorted_users:
         lines.append("데이터 없음")
+        return "\n".join(lines)
 
-    else:
-        lines.append("📊 홍보 횟수")
-        for user_id, info in sorted_users:
-            member = guild.get_member(int(user_id))
-            name = member.display_name if member else info["name"]
-            lines.append(f"{name} — {info['count']}회")
+    lines.append("📊 홍보 횟수")
+    for user_id, info in sorted_users:
+        name = get_name(guild, user_id, info.get("name", "Unknown"))
+        lines.append(f"{name} — {info['count']}회")
 
-        lines.append("")
-        lines.append("🏆 홍보 랭킹")
+    lines.append("")
+    lines.append("🏆 홍보 랭킹")
+    for idx, (user_id, info) in enumerate(sorted_users[:10], start=1):
+        name = get_name(guild, user_id, info.get("name", "Unknown"))
+        lines.append(f"{idx}위 {name} — {info['count']}회")
 
-        for i, (user_id, info) in enumerate(sorted_users[:10], start=1):
-            member = guild.get_member(int(user_id))
-            name = member.display_name if member else info["name"]
-            lines.append(f"{i}위 {name} — {info['count']}회")
+    return "\n".join(lines)
 
-    text = "\n".join(lines)
 
-    if data["rank_message"]:
+async def update_board(guild):
+    data = load_data()
+    channel = bot.get_channel(RANK_CHANNEL)
+
+    if not channel:
+        return
+
+    text = build_board_text(guild, data)
+
+    message_id = data.get("rank_message_id")
+    if message_id:
         try:
-            msg = await rank_channel.fetch_message(data["rank_message"])
+            msg = await channel.fetch_message(message_id)
             await msg.edit(content=text)
             return
-        except:
+        except Exception:
             pass
 
-    msg = await rank_channel.send(text)
-    data["rank_message"] = msg.id
-    save(data)
+    msg = await channel.send(text)
+    data["rank_message_id"] = msg.id
+    save_data(data)
+
+
+async def finalize_month(guild):
+    data = load_data()
+    month_start = date.fromisoformat(data["month_start"])
+    users = data["users"]
+
+    sorted_users = sorted(users.items(), key=lambda x: x[1]["count"], reverse=True)
+
+    rank_channel = bot.get_channel(RANK_CHANNEL)
+    reward_channel = bot.get_channel(REWARD_CHANNEL)
+
+    # 기존 진행중 메시지를 최종 랭킹으로 남기기
+    final_lines = [f"🏆 {month_label(month_start)}", "", "월간 홍보 랭킹 마감", ""]
+    if not sorted_users:
+        final_lines.append("데이터 없음")
+    else:
+        for idx, (user_id, info) in enumerate(sorted_users[:10], start=1):
+            name = get_name(guild, user_id, info.get("name", "Unknown"))
+            final_lines.append(f"{idx}위 {name} — {info['count']}회")
+
+    final_text = "\n".join(final_lines)
+
+    if rank_channel:
+        try:
+            current_msg_id = data.get("rank_message_id")
+            if current_msg_id:
+                msg = await rank_channel.fetch_message(current_msg_id)
+                await msg.edit(content=final_text)
+            else:
+                await rank_channel.send(final_text)
+        except Exception:
+            await rank_channel.send(final_text)
+
+    # 보상 메시지
+    if sorted_users and reward_channel:
+        top3 = []
+        for idx, (user_id, info) in enumerate(sorted_users[:3], start=1):
+            name = get_name(guild, user_id, info.get("name", "Unknown"))
+            top3.append((idx, user_id, name, info["count"]))
+
+        first_idx, first_user_id, first_name, first_count = top3[0]
+
+        reward_lines = [
+            f"🎉 {month_label(month_start)}",
+            "",
+            "월간 홍보 랭킹이 마감되었습니다.",
+            ""
+        ]
+
+        for idx, _, name, count in top3:
+            reward_lines.append(f"{idx}위 {name} — {count}회")
+
+        reward_lines.extend([
+            "",
+            f"🥇 1위 <@{first_user_id}> ({first_name})님 축하드립니다!",
+            "이번 달 홍보 1등 보상은 **현실 보상 5만원**입니다.",
+            f"총 홍보 횟수: {first_count}회",
+            "",
+            "축하드립니다! 🎊"
+        ])
+
+        try:
+            await reward_channel.send("\n".join(reward_lines))
+        except Exception as e:
+            await send_log(f"오류 | 보상 메시지 전송 실패 | {e}")
+
+    # 다음 달로 초기화
+    data["users"] = {}
+    data["rank_message_id"] = None
+    data["last_finalized_month"] = str(month_start)
+    data["month_start"] = str(get_next_month_start(month_start))
+    save_data(data)
+
+    await update_board(guild)
+    await send_log(f"월간 홍보 랭킹 마감 완료 | {month_label(month_start)}")
+
+
+async def ensure_rollover(guild):
+    data = load_data()
+    stored_month_start = date.fromisoformat(data["month_start"])
+    current_month_start = get_month_start()
+
+    if stored_month_start < current_month_start:
+        await finalize_month(guild)
 
 
 @bot.event
 async def on_ready():
-    print("홍보봇 실행")
+    print(f"홍보봇 실행됨: {bot.user}")
+    await send_log("홍보봇 활성화")
+
     guild = bot.get_guild(GUILD_ID)
     if guild:
+        await ensure_rollover(guild)
         await update_board(guild)
+
+    if not month_check.is_running():
+        month_check.start()
 
 
 @bot.event
 async def on_message(message):
-
     if message.author.bot:
+        return
+
+    if message.guild is None:
+        return
+
+    if message.guild.id != GUILD_ID:
         return
 
     if message.channel.id != PROMO_CHANNEL:
         return
 
-    images = [
-        a for a in message.attachments
-        if a.filename.lower().endswith(
-            (".png", ".jpg", ".jpeg", ".gif", ".webp")
-        )
-    ]
+    image_attachments = []
+    for attachment in message.attachments:
+        content_type = attachment.content_type or ""
+        filename = attachment.filename.lower()
 
-    if not images:
+        if content_type.startswith("image/") or filename.endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+        ):
+            image_attachments.append(attachment)
+
+    if not image_attachments:
         return
 
-    count = min(len(images), 10)
+    image_count = len(image_attachments)
+    if image_count > 10:
+        image_count = 10
 
-    data = load()
+    data = load_data()
+    user_id = str(message.author.id)
+    username = message.author.display_name
 
-    uid = str(message.author.id)
-
-    if uid not in data["users"]:
-        data["users"][uid] = {
+    if user_id not in data["users"]:
+        data["users"][user_id] = {
             "count": 0,
-            "name": message.author.display_name
+            "name": username
         }
 
-    data["users"][uid]["count"] += count
-    data["users"][uid]["name"] = message.author.display_name
+    data["users"][user_id]["count"] += image_count
+    data["users"][user_id]["name"] = username
 
-    save(data)
+    save_data(data)
 
-    log = bot.get_channel(LOG_CHANNEL)
-    await log.send(
-        f"{message.author.display_name}님이 홍보글을 올렸습니다. (+{count})"
-    )
-
+    await send_log(f"{username}님이 홍보글을 올렸습니다. (+{image_count})")
     await update_board(message.guild)
 
 
 @tasks.loop(minutes=1)
 async def month_check():
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
 
-    data = load()
-
+    data = load_data()
     month_start = date.fromisoformat(data["month_start"])
-    end = get_month_end(month_start)
+    month_end = get_month_end(month_start)
+    current = now()
 
-    now_dt = now()
+    if (
+        current.date() == month_end
+        and current.hour == 23
+        and data.get("last_finalized_month") != str(month_start)
+    ):
+        await finalize_month(guild)
 
-    if now_dt.date() == end and now_dt.hour == 23:
-
-        users = data["users"]
-
-        sorted_users = sorted(
-            users.items(),
-            key=lambda x: x[1]["count"],
-            reverse=True
-        )
-
-        if sorted_users:
-
-            first = sorted_users[0]
-            uid = first[0]
-            count = first[1]["count"]
-            name = first[1]["name"]
-
-            reward = bot.get_channel(REWARD_CHANNEL)
-
-            await reward.send(
-                f"🎉 {month_label(month_start)}\n\n"
-                f"🥇 1위 <@{uid}> ({name})\n"
-                f"총 홍보 횟수 {count}회\n\n"
-                f"보상 : 현실 보상 5만원\n"
-                f"축하드립니다! 🎊"
-            )
-
-        data["users"] = {}
-        data["rank_message"] = None
-
-        next_month = date(
-            month_start.year + (month_start.month // 12),
-            (month_start.month % 12) + 1,
-            1
-        )
-
-        data["month_start"] = str(next_month)
-
-        save(data)
-
-        guild = bot.get_guild(GUILD_ID)
-        await update_board(guild)
-
-
-month_check.start()
 
 bot.run(TOKEN)
