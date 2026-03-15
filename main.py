@@ -4,8 +4,6 @@ import json
 import os
 
 TOKEN = os.getenv("TOKEN")
-intents = discord.Intents.default()
-intents.members = True
 
 GUILD_ID = 1464381836099584235
 
@@ -18,23 +16,27 @@ DATA_FILE = "promo_data.json"
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
 def load_data():
-    try:
-        with open(DATA_FILE,"r") as f:
-            return json.load(f)
-    except:
+    if not os.path.exists(DATA_FILE):
         return {}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
 
 def save_data(data):
-    with open(DATA_FILE,"w") as f:
-        json.dump(data,f)
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
+
 
 @bot.event
 async def on_ready():
-    print("홍보봇 실행됨")
+    print(f"봇 로그인 완료 : {bot.user}")
+
 
 @bot.event
 async def on_message(message):
@@ -45,65 +47,60 @@ async def on_message(message):
     if message.channel.id != PROMO_CHANNEL:
         return
 
-    images = [a for a in message.attachments if a.content_type and "image" in a.content_type]
-
-    if not images:
+    if not message.attachments:
         return
-
-    count = len(images)
-
-    if count > 10:
-        count = 10
 
     data = load_data()
 
-    user = str(message.author.id)
+    user_id = str(message.author.id)
 
-    data[user] = data.get(user,0) + count
+    if user_id not in data:
+        data[user_id] = 0
+
+    data[user_id] += 1
 
     save_data(data)
 
-    log_channel = bot.get_channel(LOG_CHANNEL)
-    await log_channel.send(f"{message.author.display_name}님이 홍보글을 올렸습니다 (+{count})")
+    member = message.guild.get_member(message.author.id)
+    username = member.display_name if member else message.author.name
 
-    await update_channels()
+    count_channel = bot.get_channel(COUNT_CHANNEL)
+    await count_channel.send(f"{username} — {data[user_id]}회")
+
+    log_channel = bot.get_channel(LOG_CHANNEL)
+    await log_channel.send(f"{username} 홍보 인증 +1")
+
+    await update_rank(message.guild)
 
     await bot.process_commands(message)
 
-async def update_channels():
+
+async def update_rank(guild):
 
     data = load_data()
 
-    guild = bot.get_guild(GUILD_ID)
-
-    count_channel = bot.get_channel(COUNT_CHANNEL)
     rank_channel = bot.get_channel(RANK_CHANNEL)
 
-    text = ""
-    ranking = ""
+    sorted_users = sorted(data.items(), key=lambda x: x[1], reverse=True)
 
-    sorted_data = sorted(data.items(), key=lambda x: x[1], reverse=True)
+    text = "📊 홍보 랭킹\n\n"
 
     rank = 1
 
-    for user_id, score in sorted_data:
+    for user_id, count in sorted_users[:10]:
 
         member = guild.get_member(int(user_id))
 
-        name = member.display_name if member else "Unknown"
+        if member:
+            name = member.display_name
+        else:
+            name = "Unknown"
 
-        text += f"{name} — {score}회\n"
-        ranking += f"{rank}위 {name} — {score}회\n"
+        text += f"{rank}위 {name} — {count}회\n"
 
         rank += 1
 
-    async for m in count_channel.history(limit=20):
-        await m.delete()
+    await rank_channel.send(text)
 
-    async for m in rank_channel.history(limit=20):
-        await m.delete()
-
-    await count_channel.send(text if text else "데이터 없음")
-    await rank_channel.send(ranking if ranking else "데이터 없음")
 
 bot.run(TOKEN)
