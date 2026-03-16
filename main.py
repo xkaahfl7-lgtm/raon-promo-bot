@@ -18,6 +18,13 @@ REWARD_CHANNEL = 1481209215849726075
 DB_FILE = "promo_data.db"
 KST = ZoneInfo("Asia/Seoul")
 
+# 시작 시 1번만 강제 적용할 초기 랭킹
+FIXED_USERS = [
+    ("봉식", 44),
+    ("우진", 36),
+    ("@𝖆𝖑𝖗𝖔𝖔💥", 8),
+]
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -39,12 +46,6 @@ def get_month_start(dt=None):
 def get_month_end(month_start):
     last_day = calendar.monthrange(month_start.year, month_start.month)[1]
     return date(month_start.year, month_start.month, last_day)
-
-
-def get_next_month_start(month_start):
-    if month_start.month == 12:
-        return date(month_start.year + 1, 1, 1)
-    return date(month_start.year, month_start.month + 1, 1)
 
 
 def month_label(month_start):
@@ -91,6 +92,9 @@ def init_db():
 
     if get_meta("last_finalized_month") is None:
         set_meta("last_finalized_month", "")
+
+    if get_meta("manual_fixed_applied_v1") is None:
+        set_meta("manual_fixed_applied_v1", "")
 
     conn.close()
 
@@ -156,6 +160,14 @@ def clear_users():
     conn.close()
 
 
+def clear_processed_messages():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM processed_messages")
+    conn.commit()
+    conn.close()
+
+
 def is_message_processed(message_id: str):
     conn = get_conn()
     cur = conn.cursor()
@@ -186,14 +198,7 @@ async def send_log(text):
             pass
 
 
-def get_name(guild, user_id, fallback="Unknown"):
-    member = guild.get_member(int(user_id))
-    if member:
-        return member.display_name
-    return fallback
-
-
-def build_board_text(guild):
+def build_board_text():
     month_start_str = get_meta("month_start")
     if not month_start_str:
         month_start_str = str(get_month_start())
@@ -210,15 +215,13 @@ def build_board_text(guild):
         return "\n".join(lines)
 
     lines.append("📊 홍보 횟수")
-    for user_id, saved_name, count in rows:
-        name = get_name(guild, user_id, saved_name or "Unknown")
-        lines.append(f"{name} — {count}회")
+    for _, saved_name, count in rows:
+        lines.append(f"{saved_name} — {count}회")
 
     lines.append("")
     lines.append("🏆 홍보 랭킹")
-    for idx, (user_id, saved_name, count) in enumerate(rows[:10], start=1):
-        name = get_name(guild, user_id, saved_name or "Unknown")
-        lines.append(f"{idx}위 {name} — {count}회")
+    for idx, (_, saved_name, count) in enumerate(rows[:10], start=1):
+        lines.append(f"{idx}위 {saved_name} — {count}회")
 
     text = "\n".join(lines)
     if len(text) > 1900:
@@ -226,14 +229,14 @@ def build_board_text(guild):
     return text
 
 
-async def update_board(guild):
+async def update_board():
     channel = bot.get_channel(RANK_CHANNEL)
 
     if not channel:
         await send_log("오류 | 랭킹 채널 없음")
         return
 
-    text = build_board_text(guild)
+    text = build_board_text()
     message_id = get_meta("rank_message_id")
 
     if message_id:
@@ -266,47 +269,29 @@ def count_images(message):
     return min(count, 30)
 
 
-async def backfill_promo_messages(guild, limit=200):
-    channel = bot.get_channel(PROMO_CHANNEL)
+def apply_fixed_users_once():
+    applied = get_meta("manual_fixed_applied_v1")
+    if applied == "done":
+        return False
 
-    if not channel:
-        await send_log("오류 | 홍보 채널 없음")
-        return
+    clear_users()
 
-    recovered_messages = 0
-    recovered_images = 0
+    conn = get_conn()
+    cur = conn.cursor()
 
-    async for message in channel.history(limit=limit, oldest_first=True):
-        if message.author.bot:
-            continue
+    for idx, (name, count) in enumerate(FIXED_USERS, start=1):
+        # 실제 유저 ID 대신 고정 키 사용
+        user_id = f"fixed_{idx}"
+        cur.execute(
+            "INSERT OR REPLACE INTO users (user_id, name, count) VALUES (?, ?, ?)",
+            (user_id, name, count)
+        )
 
-        if message.guild is None:
-            continue
+    conn.commit()
+    conn.close()
 
-        if message.guild.id != GUILD_ID:
-            continue
-
-        image_count = count_images(message)
-        if image_count <= 0:
-            continue
-
-        if is_message_processed(str(message.id)):
-            continue
-
-        user_id = str(message.author.id)
-        username = message.author.display_name
-
-        upsert_user_count(user_id, username, image_count)
-        mark_message_processed(str(message.id))
-
-        recovered_messages += 1
-        recovered_images += image_count
-
-    await update_board(guild)
-    await send_log(
-        f"누락 복구 완료 | 최근 {limit}개 메시지 검사 | "
-        f"복구 메시지 {recovered_messages}개 | 복구 이미지 {recovered_images}개"
-    )
+    set_meta("manual_fixed_applied_v1", "done")
+    return True
 
 
 @bot.event
@@ -315,10 +300,11 @@ async def on_ready():
     print(f"홍보봇 실행됨: {bot.user}")
     await send_log("홍보봇 활성화")
 
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        await backfill_promo_messages(guild, limit=200)
-        await update_board(guild)
+    applied_now = apply_fixed_users_once()
+    if applied_now:
+        await send_log("기존 홍보 명단 초기화 후 지정된 3명 데이터로 수정 완료")
+
+    await update_board()
 
     if not month_check.is_running():
         month_check.start()
@@ -353,14 +339,13 @@ async def on_message(message):
     mark_message_processed(str(message.id))
 
     await send_log(f"{username} 홍보 인증 (+{image_count})")
-    await update_board(message.guild)
+    await update_board()
 
     await bot.process_commands(message)
 
 
 @tasks.loop(minutes=1)
 async def month_check():
-    # 월 변경 감지용
     month_start_str = get_meta("month_start")
     if not month_start_str:
         set_meta("month_start", str(get_month_start()))
@@ -372,16 +357,26 @@ async def month_check():
     if saved_month_start == current_month_start:
         return
 
-    guild = bot.get_guild(GUILD_ID)
-
-    # 새 달 시작 시 데이터 초기화
     clear_users()
+    clear_processed_messages()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    for idx, (name, count) in enumerate(FIXED_USERS, start=1):
+        user_id = f"fixed_{idx}"
+        cur.execute(
+            "INSERT OR REPLACE INTO users (user_id, name, count) VALUES (?, ?, ?)",
+            (user_id, name, count)
+        )
+    conn.commit()
+    conn.close()
+
     set_meta("month_start", str(current_month_start))
     set_meta("rank_message_id", "")
+    set_meta("manual_fixed_applied_v1", "done")
 
-    if guild:
-        await send_log(f"월 변경 감지 | {current_month_start.month:02d}월 기록으로 초기화")
-        await update_board(guild)
+    await send_log(f"월 변경 감지 | {current_month_start.month:02d}월 기록으로 초기화")
+    await update_board()
 
 
 if __name__ == "__main__":
