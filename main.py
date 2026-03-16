@@ -156,8 +156,8 @@ async def send_log(text):
     if channel:
         try:
             await channel.send(text)
-        except Exception as e:
-            print(f"로그 전송 실패: {e}")
+        except:
+            pass
 
 
 def get_name(guild, user_id, fallback="Unknown"):
@@ -196,7 +196,7 @@ def build_board_text(guild):
 
     text = "\n".join(lines)
     if len(text) > 1900:
-        return text[:1900] + "\n..."
+        return text[:1900]
     return text
 
 
@@ -204,7 +204,7 @@ async def update_board(guild):
     channel = bot.get_channel(RANK_CHANNEL)
 
     if not channel:
-        await send_log("오류 | 랭킹 채널을 찾을 수 없습니다.")
+        await send_log("오류 | 랭킹 채널 없음")
         return
 
     text = build_board_text(guild)
@@ -215,123 +215,29 @@ async def update_board(guild):
             msg = await channel.fetch_message(int(message_id))
             await msg.edit(content=text)
             return
-        except Exception as e:
-            await send_log(f"랭킹 메시지 수정 실패 | 새 메시지 생성 | {e}")
+        except:
+            pass
 
     try:
         msg = await channel.send(text)
         set_meta("rank_message_id", str(msg.id))
     except Exception as e:
-        await send_log(f"오류 | 랭킹 메시지 생성 실패 | {e}")
+        await send_log(f"랭킹 생성 실패 | {e}")
 
 
-async def finalize_month(guild):
-    month_start_str = get_meta("month_start")
-    if not month_start_str:
-        month_start_str = str(get_month_start())
-        set_meta("month_start", month_start_str)
-
-    month_start = date.fromisoformat(month_start_str)
-    rows = get_users_sorted()
-
-    rank_channel = bot.get_channel(RANK_CHANNEL)
-    reward_channel = bot.get_channel(REWARD_CHANNEL)
-
-    final_lines = [f"🏆 {month_label(month_start)}", "", "월간 홍보 랭킹 마감", ""]
-
-    if not rows:
-        final_lines.append("데이터 없음")
-    else:
-        for idx, (user_id, saved_name, count) in enumerate(rows[:10], start=1):
-            name = get_name(guild, user_id, saved_name or "Unknown")
-            final_lines.append(f"{idx}위 {name} — {count}회")
-
-    final_text = "\n".join(final_lines)
-
-    if rank_channel:
-        try:
-            current_msg_id = get_meta("rank_message_id")
-            if current_msg_id:
-                msg = await rank_channel.fetch_message(int(current_msg_id))
-                await msg.edit(content=final_text)
-            else:
-                await rank_channel.send(final_text)
-        except Exception:
-            try:
-                await rank_channel.send(final_text)
-            except Exception as e:
-                await send_log(f"오류 | 월간 마감 랭킹 전송 실패 | {e}")
-
-    if rows and reward_channel:
-        top3 = []
-        for idx, (user_id, saved_name, count) in enumerate(rows[:3], start=1):
-            name = get_name(guild, user_id, saved_name or "Unknown")
-            top3.append((idx, user_id, name, count))
-
-        first_idx, first_user_id, first_name, first_count = top3[0]
-
-        reward_lines = [
-            f"🎉 {month_label(month_start)}",
-            "",
-            "월간 홍보 랭킹이 마감되었습니다.",
-            ""
-        ]
-
-        for idx, _, name, count in top3:
-            reward_lines.append(f"{idx}위 {name} — {count}회")
-
-        reward_lines.extend([
-            "",
-            f"🥇 1위 <@{first_user_id}> ({first_name})님 축하드립니다!",
-            "이번 달 홍보 1등 보상은 **현실 보상 5만원**입니다.",
-            f"총 홍보 횟수: {first_count}회",
-            "",
-            "축하드립니다! 🎊"
-        ])
-
-        try:
-            await reward_channel.send("\n".join(reward_lines))
-        except Exception as e:
-            await send_log(f"오류 | 보상 메시지 전송 실패 | {e}")
-
-    clear_users()
-    set_meta("rank_message_id", "")
-    set_meta("last_finalized_month", str(month_start))
-    set_meta("month_start", str(get_next_month_start(month_start)))
-
-    await update_board(guild)
-    await send_log(f"월간 홍보 랭킹 마감 완료 | {month_label(month_start)}")
-
-
-async def ensure_rollover(guild):
-    stored_month_start_str = get_meta("month_start")
-    if not stored_month_start_str:
-        stored_month_start_str = str(get_month_start())
-        set_meta("month_start", stored_month_start_str)
-
-    stored_month_start = date.fromisoformat(stored_month_start_str)
-    current_month_start = get_month_start()
-
-    if stored_month_start < current_month_start:
-        await finalize_month(guild)
-
-
-def count_image_attachments(message: discord.Message) -> int:
+def count_images(message):
     count = 0
 
     for attachment in message.attachments:
-        content_type = (attachment.content_type or "").lower()
-        filename = (attachment.filename or "").lower()
-
-        is_image = (
-            content_type.startswith("image/")
-            or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"))
-        )
-
-        if is_image:
+        filename = attachment.filename.lower()
+        if filename.endswith((".png",".jpg",".jpeg",".gif",".webp",".bmp")):
             count += 1
 
-    return min(count, 10)
+    for embed in message.embeds:
+        if embed.image or embed.thumbnail:
+            count += 1
+
+    return min(count,30)
 
 
 @bot.event
@@ -342,10 +248,7 @@ async def on_ready():
 
     guild = bot.get_guild(GUILD_ID)
     if guild:
-        await ensure_rollover(guild)
         await update_board(guild)
-    else:
-        await send_log("오류 | GUILD_ID 서버를 찾지 못했습니다.")
 
     if not month_check.is_running():
         month_check.start()
@@ -365,10 +268,9 @@ async def on_message(message):
     if message.channel.id != PROMO_CHANNEL:
         return
 
-    image_count = count_image_attachments(message)
+    image_count = count_images(message)
 
     if image_count <= 0:
-        await send_log(f"홍보 미반영 | {message.author.display_name} | 이미지 첨부 없음")
         return
 
     user_id = str(message.author.id)
@@ -376,7 +278,7 @@ async def on_message(message):
 
     upsert_user_count(user_id, username, image_count)
 
-    await send_log(f"{username}님이 홍보글을 올렸습니다. (+{image_count})")
+    await send_log(f"{username} 홍보 인증 (+{image_count})")
     await update_board(message.guild)
 
     await bot.process_commands(message)
@@ -384,26 +286,7 @@ async def on_message(message):
 
 @tasks.loop(minutes=1)
 async def month_check():
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-
-    month_start_str = get_meta("month_start")
-    if not month_start_str:
-        month_start_str = str(get_month_start())
-        set_meta("month_start", month_start_str)
-
-    month_start = date.fromisoformat(month_start_str)
-    month_end = get_month_end(month_start)
-    current = now()
-    last_finalized_month = get_meta("last_finalized_month") or ""
-
-    if (
-        current.date() == month_end
-        and current.hour == 23
-        and last_finalized_month != str(month_start)
-    ):
-        await finalize_month(guild)
+    pass
 
 
 bot.run(TOKEN)
