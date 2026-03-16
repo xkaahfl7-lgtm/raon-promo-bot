@@ -63,13 +63,28 @@ def default_data():
 
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return default_data()
+        data = default_data()
+        save_data(data)
+        return data
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+
+        if "users" not in data:
+            data["users"] = {}
+        if "rank_message_id" not in data:
+            data["rank_message_id"] = None
+        if "month_start" not in data:
+            data["month_start"] = str(get_month_start())
+        if "last_finalized_month" not in data:
+            data["last_finalized_month"] = None
+
+        return data
     except Exception:
-        return default_data()
+        data = default_data()
+        save_data(data)
+        return data
 
 
 def save_data(data):
@@ -78,12 +93,13 @@ def save_data(data):
 
 
 async def send_log(text):
+    print(text)
     channel = bot.get_channel(LOG_CHANNEL)
     if channel:
         try:
             await channel.send(text)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"로그 전송 실패: {e}")
 
 
 def get_name(guild, user_id, fallback="Unknown"):
@@ -117,7 +133,11 @@ def build_board_text(guild, data):
         name = get_name(guild, user_id, info.get("name", "Unknown"))
         lines.append(f"{idx}위 {name} — {info['count']}회")
 
-    return "\n".join(lines)
+    text = "\n".join(lines)
+
+    if len(text) > 1900:
+        return text[:1900] + "\n..."
+    return text
 
 
 async def update_board(guild):
@@ -125,22 +145,26 @@ async def update_board(guild):
     channel = bot.get_channel(RANK_CHANNEL)
 
     if not channel:
+        await send_log("오류 | 랭킹 채널을 찾을 수 없습니다.")
         return
 
     text = build_board_text(guild, data)
-
     message_id = data.get("rank_message_id")
+
     if message_id:
         try:
             msg = await channel.fetch_message(message_id)
             await msg.edit(content=text)
             return
-        except Exception:
-            pass
+        except Exception as e:
+            await send_log(f"랭킹 메시지 수정 실패 | 새 메시지 생성 | {e}")
 
-    msg = await channel.send(text)
-    data["rank_message_id"] = msg.id
-    save_data(data)
+    try:
+        msg = await channel.send(text)
+        data["rank_message_id"] = msg.id
+        save_data(data)
+    except Exception as e:
+        await send_log(f"오류 | 랭킹 메시지 생성 실패 | {e}")
 
 
 async def finalize_month(guild):
@@ -153,7 +177,6 @@ async def finalize_month(guild):
     rank_channel = bot.get_channel(RANK_CHANNEL)
     reward_channel = bot.get_channel(REWARD_CHANNEL)
 
-    # 기존 진행중 메시지를 최종 랭킹으로 남기기
     final_lines = [f"🏆 {month_label(month_start)}", "", "월간 홍보 랭킹 마감", ""]
     if not sorted_users:
         final_lines.append("데이터 없음")
@@ -175,7 +198,6 @@ async def finalize_month(guild):
         except Exception:
             await rank_channel.send(final_text)
 
-    # 보상 메시지
     if sorted_users and reward_channel:
         top3 = []
         for idx, (user_id, info) in enumerate(sorted_users[:3], start=1):
@@ -208,7 +230,6 @@ async def finalize_month(guild):
         except Exception as e:
             await send_log(f"오류 | 보상 메시지 전송 실패 | {e}")
 
-    # 다음 달로 초기화
     data["users"] = {}
     data["rank_message_id"] = None
     data["last_finalized_month"] = str(month_start)
@@ -228,6 +249,24 @@ async def ensure_rollover(guild):
         await finalize_month(guild)
 
 
+def count_image_attachments(message: discord.Message) -> int:
+    count = 0
+
+    for attachment in message.attachments:
+        content_type = (attachment.content_type or "").lower()
+        filename = (attachment.filename or "").lower()
+
+        is_image = (
+            content_type.startswith("image/")
+            or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"))
+        )
+
+        if is_image:
+            count += 1
+
+    return min(count, 10)
+
+
 @bot.event
 async def on_ready():
     print(f"홍보봇 실행됨: {bot.user}")
@@ -237,6 +276,8 @@ async def on_ready():
     if guild:
         await ensure_rollover(guild)
         await update_board(guild)
+    else:
+        await send_log("오류 | GUILD_ID 서버를 찾지 못했습니다.")
 
     if not month_check.is_running():
         month_check.start()
@@ -256,22 +297,11 @@ async def on_message(message):
     if message.channel.id != PROMO_CHANNEL:
         return
 
-    image_attachments = []
-    for attachment in message.attachments:
-        content_type = attachment.content_type or ""
-        filename = attachment.filename.lower()
+    image_count = count_image_attachments(message)
 
-        if content_type.startswith("image/") or filename.endswith(
-            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-        ):
-            image_attachments.append(attachment)
-
-    if not image_attachments:
+    if image_count <= 0:
+        await send_log(f"홍보 미반영 | {message.author.display_name} | 이미지 첨부 없음")
         return
-
-    image_count = len(image_attachments)
-    if image_count > 10:
-        image_count = 10
 
     data = load_data()
     user_id = str(message.author.id)
@@ -290,6 +320,8 @@ async def on_message(message):
 
     await send_log(f"{username}님이 홍보글을 올렸습니다. (+{image_count})")
     await update_board(message.guild)
+
+    await bot.process_commands(message)
 
 
 @tasks.loop(minutes=1)
