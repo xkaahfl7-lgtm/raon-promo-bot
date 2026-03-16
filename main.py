@@ -75,6 +75,12 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            message_id TEXT PRIMARY KEY
+        )
+    """)
+
     conn.commit()
 
     if get_meta("month_start") is None:
@@ -150,13 +156,33 @@ def clear_users():
     conn.close()
 
 
+def is_message_processed(message_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_message_processed(message_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)",
+        (message_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
 async def send_log(text):
     print(text)
     channel = bot.get_channel(LOG_CHANNEL)
     if channel:
         try:
             await channel.send(text)
-        except:
+        except Exception:
             pass
 
 
@@ -215,7 +241,7 @@ async def update_board(guild):
             msg = await channel.fetch_message(int(message_id))
             await msg.edit(content=text)
             return
-        except:
+        except Exception:
             pass
 
     try:
@@ -230,14 +256,57 @@ def count_images(message):
 
     for attachment in message.attachments:
         filename = attachment.filename.lower()
-        if filename.endswith((".png",".jpg",".jpeg",".gif",".webp",".bmp")):
+        if filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
             count += 1
 
     for embed in message.embeds:
         if embed.image or embed.thumbnail:
             count += 1
 
-    return min(count,30)
+    return min(count, 30)
+
+
+async def backfill_promo_messages(guild, limit=200):
+    channel = bot.get_channel(PROMO_CHANNEL)
+
+    if not channel:
+        await send_log("오류 | 홍보 채널 없음")
+        return
+
+    recovered_messages = 0
+    recovered_images = 0
+
+    async for message in channel.history(limit=limit, oldest_first=True):
+        if message.author.bot:
+            continue
+
+        if message.guild is None:
+            continue
+
+        if message.guild.id != GUILD_ID:
+            continue
+
+        image_count = count_images(message)
+        if image_count <= 0:
+            continue
+
+        if is_message_processed(str(message.id)):
+            continue
+
+        user_id = str(message.author.id)
+        username = message.author.display_name
+
+        upsert_user_count(user_id, username, image_count)
+        mark_message_processed(str(message.id))
+
+        recovered_messages += 1
+        recovered_images += image_count
+
+    await update_board(guild)
+    await send_log(
+        f"누락 복구 완료 | 최근 {limit}개 메시지 검사 | "
+        f"복구 메시지 {recovered_messages}개 | 복구 이미지 {recovered_images}개"
+    )
 
 
 @bot.event
@@ -248,6 +317,7 @@ async def on_ready():
 
     guild = bot.get_guild(GUILD_ID)
     if guild:
+        await backfill_promo_messages(guild, limit=200)
         await update_board(guild)
 
     if not month_check.is_running():
@@ -273,10 +343,14 @@ async def on_message(message):
     if image_count <= 0:
         return
 
+    if is_message_processed(str(message.id)):
+        return
+
     user_id = str(message.author.id)
     username = message.author.display_name
 
     upsert_user_count(user_id, username, image_count)
+    mark_message_processed(str(message.id))
 
     await send_log(f"{username} 홍보 인증 (+{image_count})")
     await update_board(message.guild)
@@ -286,7 +360,32 @@ async def on_message(message):
 
 @tasks.loop(minutes=1)
 async def month_check():
-    pass
+    # 월 변경 감지용
+    month_start_str = get_meta("month_start")
+    if not month_start_str:
+        set_meta("month_start", str(get_month_start()))
+        return
+
+    saved_month_start = date.fromisoformat(month_start_str)
+    current_month_start = get_month_start()
+
+    if saved_month_start == current_month_start:
+        return
+
+    guild = bot.get_guild(GUILD_ID)
+
+    # 새 달 시작 시 데이터 초기화
+    clear_users()
+    set_meta("month_start", str(current_month_start))
+    set_meta("rank_message_id", "")
+
+    if guild:
+        await send_log(f"월 변경 감지 | {current_month_start.month:02d}월 기록으로 초기화")
+        await update_board(guild)
 
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    if not TOKEN:
+        raise ValueError("환경변수 TOKEN 이 비어 있습니다. Railway Variables에 TOKEN을 넣어주세요.")
+
+    bot.run(TOKEN)
