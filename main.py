@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
-import json
 import os
+import sqlite3
 import calendar
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -15,7 +15,7 @@ RANK_CHANNEL = 1481209156508586055
 LOG_CHANNEL = 1481661104580067419
 REWARD_CHANNEL = 1481209215849726075
 
-DATA_FILE = "promo_data.json"
+DB_FILE = "promo_data.db"
 KST = ZoneInfo("Asia/Seoul")
 
 intents = discord.Intents.default()
@@ -52,44 +52,102 @@ def month_label(month_start):
     return f"{month_start.month:02d}월 {month_start.day:02d}일 ~ {month_end.month:02d}월 {month_end.day:02d}일 기록현황"
 
 
-def default_data():
-    return {
-        "users": {},
-        "rank_message_id": None,
-        "month_start": str(get_month_start()),
-        "last_finalized_month": None
-    }
+def get_conn():
+    return sqlite3.connect(DB_FILE)
 
 
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        data = default_data()
-        save_data(data)
-        return data
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
 
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
 
-        if "users" not in data:
-            data["users"] = {}
-        if "rank_message_id" not in data:
-            data["rank_message_id"] = None
-        if "month_start" not in data:
-            data["month_start"] = str(get_month_start())
-        if "last_finalized_month" not in data:
-            data["last_finalized_month"] = None
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
 
-        return data
-    except Exception:
-        data = default_data()
-        save_data(data)
-        return data
+    conn.commit()
+
+    if get_meta("month_start") is None:
+        set_meta("month_start", str(get_month_start()))
+
+    if get_meta("rank_message_id") is None:
+        set_meta("rank_message_id", "")
+
+    if get_meta("last_finalized_month") is None:
+        set_meta("last_finalized_month", "")
+
+    conn.close()
 
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+def get_meta(key: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_meta(key: str, value: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (key, value))
+    conn.commit()
+    conn.close()
+
+
+def get_users_sorted():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, name, count FROM users ORDER BY count DESC, name ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def upsert_user_count(user_id: str, name: str, add_count: int):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT count FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+
+    if row:
+        new_count = int(row[0]) + add_count
+        cur.execute(
+            "UPDATE users SET name = ?, count = ? WHERE user_id = ?",
+            (name, new_count, user_id)
+        )
+    else:
+        cur.execute(
+            "INSERT INTO users (user_id, name, count) VALUES (?, ?, ?)",
+            (user_id, name, add_count)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def clear_users():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users")
+    conn.commit()
+    conn.close()
 
 
 async def send_log(text):
@@ -109,51 +167,52 @@ def get_name(guild, user_id, fallback="Unknown"):
     return fallback
 
 
-def build_board_text(guild, data):
-    month_start = date.fromisoformat(data["month_start"])
+def build_board_text(guild):
+    month_start_str = get_meta("month_start")
+    if not month_start_str:
+        month_start_str = str(get_month_start())
+        set_meta("month_start", month_start_str)
+
+    month_start = date.fromisoformat(month_start_str)
     label = month_label(month_start)
 
-    users = data["users"]
-    sorted_users = sorted(users.items(), key=lambda x: x[1]["count"], reverse=True)
-
+    rows = get_users_sorted()
     lines = [f"🏆 {label}", ""]
 
-    if not sorted_users:
+    if not rows:
         lines.append("데이터 없음")
         return "\n".join(lines)
 
     lines.append("📊 홍보 횟수")
-    for user_id, info in sorted_users:
-        name = get_name(guild, user_id, info.get("name", "Unknown"))
-        lines.append(f"{name} — {info['count']}회")
+    for user_id, saved_name, count in rows:
+        name = get_name(guild, user_id, saved_name or "Unknown")
+        lines.append(f"{name} — {count}회")
 
     lines.append("")
     lines.append("🏆 홍보 랭킹")
-    for idx, (user_id, info) in enumerate(sorted_users[:10], start=1):
-        name = get_name(guild, user_id, info.get("name", "Unknown"))
-        lines.append(f"{idx}위 {name} — {info['count']}회")
+    for idx, (user_id, saved_name, count) in enumerate(rows[:10], start=1):
+        name = get_name(guild, user_id, saved_name or "Unknown")
+        lines.append(f"{idx}위 {name} — {count}회")
 
     text = "\n".join(lines)
-
     if len(text) > 1900:
         return text[:1900] + "\n..."
     return text
 
 
 async def update_board(guild):
-    data = load_data()
     channel = bot.get_channel(RANK_CHANNEL)
 
     if not channel:
         await send_log("오류 | 랭킹 채널을 찾을 수 없습니다.")
         return
 
-    text = build_board_text(guild, data)
-    message_id = data.get("rank_message_id")
+    text = build_board_text(guild)
+    message_id = get_meta("rank_message_id")
 
     if message_id:
         try:
-            msg = await channel.fetch_message(message_id)
+            msg = await channel.fetch_message(int(message_id))
             await msg.edit(content=text)
             return
         except Exception as e:
@@ -161,48 +220,53 @@ async def update_board(guild):
 
     try:
         msg = await channel.send(text)
-        data["rank_message_id"] = msg.id
-        save_data(data)
+        set_meta("rank_message_id", str(msg.id))
     except Exception as e:
         await send_log(f"오류 | 랭킹 메시지 생성 실패 | {e}")
 
 
 async def finalize_month(guild):
-    data = load_data()
-    month_start = date.fromisoformat(data["month_start"])
-    users = data["users"]
+    month_start_str = get_meta("month_start")
+    if not month_start_str:
+        month_start_str = str(get_month_start())
+        set_meta("month_start", month_start_str)
 
-    sorted_users = sorted(users.items(), key=lambda x: x[1]["count"], reverse=True)
+    month_start = date.fromisoformat(month_start_str)
+    rows = get_users_sorted()
 
     rank_channel = bot.get_channel(RANK_CHANNEL)
     reward_channel = bot.get_channel(REWARD_CHANNEL)
 
     final_lines = [f"🏆 {month_label(month_start)}", "", "월간 홍보 랭킹 마감", ""]
-    if not sorted_users:
+
+    if not rows:
         final_lines.append("데이터 없음")
     else:
-        for idx, (user_id, info) in enumerate(sorted_users[:10], start=1):
-            name = get_name(guild, user_id, info.get("name", "Unknown"))
-            final_lines.append(f"{idx}위 {name} — {info['count']}회")
+        for idx, (user_id, saved_name, count) in enumerate(rows[:10], start=1):
+            name = get_name(guild, user_id, saved_name or "Unknown")
+            final_lines.append(f"{idx}위 {name} — {count}회")
 
     final_text = "\n".join(final_lines)
 
     if rank_channel:
         try:
-            current_msg_id = data.get("rank_message_id")
+            current_msg_id = get_meta("rank_message_id")
             if current_msg_id:
-                msg = await rank_channel.fetch_message(current_msg_id)
+                msg = await rank_channel.fetch_message(int(current_msg_id))
                 await msg.edit(content=final_text)
             else:
                 await rank_channel.send(final_text)
         except Exception:
-            await rank_channel.send(final_text)
+            try:
+                await rank_channel.send(final_text)
+            except Exception as e:
+                await send_log(f"오류 | 월간 마감 랭킹 전송 실패 | {e}")
 
-    if sorted_users and reward_channel:
+    if rows and reward_channel:
         top3 = []
-        for idx, (user_id, info) in enumerate(sorted_users[:3], start=1):
-            name = get_name(guild, user_id, info.get("name", "Unknown"))
-            top3.append((idx, user_id, name, info["count"]))
+        for idx, (user_id, saved_name, count) in enumerate(rows[:3], start=1):
+            name = get_name(guild, user_id, saved_name or "Unknown")
+            top3.append((idx, user_id, name, count))
 
         first_idx, first_user_id, first_name, first_count = top3[0]
 
@@ -230,19 +294,22 @@ async def finalize_month(guild):
         except Exception as e:
             await send_log(f"오류 | 보상 메시지 전송 실패 | {e}")
 
-    data["users"] = {}
-    data["rank_message_id"] = None
-    data["last_finalized_month"] = str(month_start)
-    data["month_start"] = str(get_next_month_start(month_start))
-    save_data(data)
+    clear_users()
+    set_meta("rank_message_id", "")
+    set_meta("last_finalized_month", str(month_start))
+    set_meta("month_start", str(get_next_month_start(month_start)))
 
     await update_board(guild)
     await send_log(f"월간 홍보 랭킹 마감 완료 | {month_label(month_start)}")
 
 
 async def ensure_rollover(guild):
-    data = load_data()
-    stored_month_start = date.fromisoformat(data["month_start"])
+    stored_month_start_str = get_meta("month_start")
+    if not stored_month_start_str:
+        stored_month_start_str = str(get_month_start())
+        set_meta("month_start", stored_month_start_str)
+
+    stored_month_start = date.fromisoformat(stored_month_start_str)
     current_month_start = get_month_start()
 
     if stored_month_start < current_month_start:
@@ -269,6 +336,7 @@ def count_image_attachments(message: discord.Message) -> int:
 
 @bot.event
 async def on_ready():
+    init_db()
     print(f"홍보봇 실행됨: {bot.user}")
     await send_log("홍보봇 활성화")
 
@@ -303,20 +371,10 @@ async def on_message(message):
         await send_log(f"홍보 미반영 | {message.author.display_name} | 이미지 첨부 없음")
         return
 
-    data = load_data()
     user_id = str(message.author.id)
     username = message.author.display_name
 
-    if user_id not in data["users"]:
-        data["users"][user_id] = {
-            "count": 0,
-            "name": username
-        }
-
-    data["users"][user_id]["count"] += image_count
-    data["users"][user_id]["name"] = username
-
-    save_data(data)
+    upsert_user_count(user_id, username, image_count)
 
     await send_log(f"{username}님이 홍보글을 올렸습니다. (+{image_count})")
     await update_board(message.guild)
@@ -330,15 +388,20 @@ async def month_check():
     if not guild:
         return
 
-    data = load_data()
-    month_start = date.fromisoformat(data["month_start"])
+    month_start_str = get_meta("month_start")
+    if not month_start_str:
+        month_start_str = str(get_month_start())
+        set_meta("month_start", month_start_str)
+
+    month_start = date.fromisoformat(month_start_str)
     month_end = get_month_end(month_start)
     current = now()
+    last_finalized_month = get_meta("last_finalized_month") or ""
 
     if (
         current.date() == month_end
         and current.hour == 23
-        and data.get("last_finalized_month") != str(month_start)
+        and last_finalized_month != str(month_start)
     ):
         await finalize_month(guild)
 
