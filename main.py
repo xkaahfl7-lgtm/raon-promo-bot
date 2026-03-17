@@ -5,6 +5,7 @@ import sqlite3
 import calendar
 import re
 import unicodedata
+import asyncio
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
@@ -15,18 +16,22 @@ GUILD_ID = 1464381836099584235
 PROMO_CHANNEL = 1465360797311172730
 RANK_CHANNEL = 1481209156508586055
 LOG_CHANNEL = 1481661104580067419
-REWARD_CHANNEL = 1481209215849726075
 
 DB_FILE = "promo_data.db"
 KST = ZoneInfo("Asia/Seoul")
 
-# 기존 누적값(초기 복구값)
-# 여기 적힌 값은 "별도 유저"로 저장하지 않고
-# 보드 만들 때 실제 유저 기록과 합산됩니다.
+# 기존 누적값
 BASELINE_COUNTS = {
-    "봉식": 44,
-    "우진": 36,
-    "@𝖆𝖑𝖗𝖔𝖔💥": 8,
+    "IGㆍ봉식": 44,
+    "AMㆍ우진": 36,
+    "@alroo💥": 8,
+}
+
+# 출력 이름 강제 통일
+PREFERRED_DISPLAY = {
+    "봉식": "IGㆍ봉식",
+    "우진": "AMㆍ우진",
+    "alroo": "@alroo💥",
 }
 
 intents = discord.Intents.default()
@@ -35,6 +40,7 @@ intents.members = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+board_lock = asyncio.Lock()
 
 
 def now():
@@ -103,9 +109,6 @@ def init_db():
     if get_meta("rank_message_id") is None:
         set_meta("rank_message_id", "")
 
-    if get_meta("last_finalized_month") is None:
-        set_meta("last_finalized_month", "")
-
 
 def ensure_column_exists(table_name: str, column_name: str, column_type_sql: str):
     with get_conn() as conn:
@@ -118,9 +121,6 @@ def ensure_column_exists(table_name: str, column_name: str, column_type_sql: str
 
 
 def migrate_old_name_column_if_needed():
-    """
-    예전 users(name) 구조를 users(display_name) 구조로 자동 보정
-    """
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("PRAGMA table_info(users)")
@@ -131,7 +131,7 @@ def migrate_old_name_column_if_needed():
                 cur.execute("""
                     UPDATE users
                     SET display_name = name
-                    WHERE (display_name IS NULL OR display_name = '')
+                    WHERE display_name IS NULL OR display_name = ''
                 """)
                 conn.commit()
             except Exception:
@@ -224,20 +224,23 @@ def get_all_users():
 
 
 def normalize_person_key(name: str) -> str:
-    """
-    중복 이름 자동 정리용 핵심 함수
-    예:
-    IGㆍ봉식 -> 봉식
-    AMㆍ우진 -> 우진
-    @𝖆𝖑𝖗𝖔𝖔💥 -> alroo
-    """
     if not name:
         return ""
 
-    text = unicodedata.normalize("NFKC", str(name)).strip().lower()
+    text = str(name)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.strip()
 
-    # 앞쪽 직급/역할 제거
-    # 예: IGㆍ봉식 / AM·우진 / STAFF_누구 / DEV-누구
+    # 제로폭 문자 제거
+    text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)
+
+    # 괄호 제거
+    text = text.replace("(", "").replace(")", "")
+
+    # 소문자
+    text = text.lower()
+
+    # 맨 앞 직급 제거
     text = re.sub(
         r'^(gm|dgm|am|im|ig|staff|dev|admin|mod)[\s\-_ㆍ·|/\\]*',
         '',
@@ -248,22 +251,48 @@ def normalize_person_key(name: str) -> str:
     # 맨 앞 @ 제거
     text = re.sub(r'^@+', '', text)
 
+    # 공백 제거
+    text = re.sub(r'\s+', '', text)
+
     # 특수문자 제거
     text = re.sub(r'[^0-9a-z가-힣]', '', text)
 
-    return text
+    # 별칭 통합
+    alias_map = {
+        "우진": "우진",
+        "woojin": "우진",
+        "ujin": "우진",
+        "봉식": "봉식",
+        "bongsik": "봉식",
+        "bongsik": "봉식",
+        "alroo": "alroo",
+    }
+
+    return alias_map.get(text, text)
+
+
+def score_display_name(name: str) -> int:
+    score = 0
+    text = unicodedata.normalize("NFKC", str(name)).strip()
+
+    if re.search(r'^(GM|DGM|AM|IM|IG|STAFF|DEV)[\s\-_ㆍ·|/\\(]*', text, re.IGNORECASE):
+        score += 20
+
+    if len(text) >= 2:
+        score += 3
+
+    if "@" in text:
+        score += 1
+
+    return score
 
 
 def choose_better_display_name(old_name: str, new_name: str) -> str:
-    """
-    표시명은 가능하면 실제 최신 닉네임 느낌이 나는 쪽으로 유지
-    """
     if not old_name:
         return new_name
     if not new_name:
         return old_name
 
-    # 직급 포함 이름을 우선으로
     old_score = score_display_name(old_name)
     new_score = score_display_name(new_name)
 
@@ -272,27 +301,10 @@ def choose_better_display_name(old_name: str, new_name: str) -> str:
     return old_name
 
 
-def score_display_name(name: str) -> int:
-    score = 0
-    text = unicodedata.normalize("NFKC", str(name)).strip()
-
-    if re.search(r'^(GM|DGM|AM|IM|IG|STAFF|DEV)[\s\-_ㆍ·|/\\]*', text, re.IGNORECASE):
-        score += 10
-    if len(text) >= 2:
-        score += 1
-    if "@" in text:
-        score += 1
-    return score
-
-
 def build_aggregated_rows():
-    """
-    user_id별 저장 데이터 + BASELINE_COUNTS 를
-    사람 기준으로 자동 합산해서 표시용 랭킹 생성
-    """
     grouped = {}
 
-    # 1) baseline 먼저 넣기
+    # 1) baseline 먼저 반영
     for raw_name, base_count in BASELINE_COUNTS.items():
         key = normalize_person_key(raw_name)
         if not key:
@@ -305,7 +317,7 @@ def build_aggregated_rows():
             "last_seen": ""
         }
 
-    # 2) 실제 DB 유저 합산
+    # 2) 실제 DB 반영
     rows = get_all_users()
     for row in rows:
         user_id = str(row["user_id"])
@@ -335,12 +347,16 @@ def build_aggregated_rows():
         if last_seen > grouped[key]["last_seen"]:
             grouped[key]["last_seen"] = last_seen
 
-    # 3) 정렬
     result = []
     for key, value in grouped.items():
+        display_name = value["display_name"]
+
+        if key in PREFERRED_DISPLAY:
+            display_name = PREFERRED_DISPLAY[key]
+
         result.append({
             "person_key": key,
-            "display_name": value["display_name"],
+            "display_name": display_name,
             "count": int(value["count"]),
             "last_seen": value["last_seen"]
         })
@@ -387,36 +403,37 @@ def build_board_text():
 
     text = "\n".join(lines)
     if len(text) > 1900:
-        return text[:1900]
+        text = text[:1900]
     return text
 
 
 async def update_board():
-    channel = bot.get_channel(RANK_CHANNEL)
+    async with board_lock:
+        channel = bot.get_channel(RANK_CHANNEL)
 
-    if not channel:
-        await send_log("오류 | 랭킹 채널 없음")
-        return
-
-    text = build_board_text()
-    message_id = get_meta("rank_message_id")
-
-    if message_id:
-        try:
-            msg = await channel.fetch_message(int(message_id))
-            await msg.edit(content=text)
+        if not channel:
+            await send_log("오류 | 랭킹 채널 없음")
             return
-        except Exception:
-            pass
 
-    try:
-        msg = await channel.send(text)
-        set_meta("rank_message_id", str(msg.id))
-    except Exception as e:
-        await send_log(f"랭킹 생성 실패 | {e}")
+        text = build_board_text()
+        message_id = get_meta("rank_message_id")
+
+        if message_id:
+            try:
+                msg = await channel.fetch_message(int(message_id))
+                await msg.edit(content=text)
+                return
+            except Exception:
+                pass
+
+        try:
+            msg = await channel.send(text)
+            set_meta("rank_message_id", str(msg.id))
+        except Exception as e:
+            await send_log(f"오류 | 랭킹 생성 실패 | {e}")
 
 
-def count_images(message):
+def count_images(message: discord.Message):
     count = 0
 
     for attachment in message.attachments:
@@ -443,7 +460,7 @@ async def on_ready():
 
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
@@ -461,7 +478,8 @@ async def on_message(message):
     if image_count <= 0:
         return
 
-    if is_message_processed(str(message.id)):
+    msg_id = str(message.id)
+    if is_message_processed(msg_id):
         return
 
     user_id = str(message.author.id)
@@ -469,7 +487,7 @@ async def on_message(message):
 
     try:
         upsert_user_count(user_id, username, image_count)
-        mark_message_processed(str(message.id))
+        mark_message_processed(msg_id)
         await send_log(f"홍보 인증 | {username} (+{image_count})")
         await update_board()
     except Exception as e:
@@ -480,25 +498,29 @@ async def on_message(message):
 
 @tasks.loop(minutes=1)
 async def month_check():
-    month_start_str = get_meta("month_start")
-    if not month_start_str:
-        set_meta("month_start", str(get_month_start()))
-        return
+    try:
+        month_start_str = get_meta("month_start")
+        if not month_start_str:
+            set_meta("month_start", str(get_month_start()))
+            return
 
-    saved_month_start = date.fromisoformat(month_start_str)
-    current_month_start = get_month_start()
+        saved_month_start = date.fromisoformat(month_start_str)
+        current_month_start = get_month_start()
 
-    if saved_month_start == current_month_start:
-        return
+        if saved_month_start == current_month_start:
+            return
 
-    clear_users()
-    clear_processed_messages()
+        clear_users()
+        clear_processed_messages()
 
-    set_meta("month_start", str(current_month_start))
-    set_meta("rank_message_id", "")
+        set_meta("month_start", str(current_month_start))
+        set_meta("rank_message_id", "")
 
-    await send_log(f"월 변경 감지 | {current_month_start.month:02d}월 기록으로 초기화")
-    await update_board()
+        await send_log(f"월 변경 감지 | {current_month_start.month:02d}월 기록으로 초기화")
+        await update_board()
+
+    except Exception as e:
+        await send_log(f"오류 | 월 변경 체크 실패 | {e}")
 
 
 if __name__ == "__main__":
