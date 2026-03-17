@@ -20,18 +20,20 @@ LOG_CHANNEL = 1481661104580067419
 DB_FILE = "promo_data.db"
 KST = ZoneInfo("Asia/Seoul")
 
-# 기존 누적값
+# 새로 추가할 기본값만 넣기
+# 우진/봉식/alroo는 이미 DB에 있다고 했으니 넣지 않음
 BASELINE_COUNTS = {
-    "IGㆍ봉식": 44,
-    "AMㆍ우진": 36,
-    "@alroo💥": 8,
+    "STAFFㆍ⭐호랭": 6,
+    "STAFFㆍ⭐백구": 3,
 }
 
-# 출력 이름 강제 통일
+# 표시명 강제 통일
 PREFERRED_DISPLAY = {
     "봉식": "IGㆍ봉식",
     "우진": "AMㆍ우진",
     "alroo": "@alroo💥",
+    "호랭": "STAFFㆍ⭐호랭",
+    "백구": "STAFFㆍ⭐백구",
 }
 
 intents = discord.Intents.default()
@@ -251,21 +253,27 @@ def normalize_person_key(name: str) -> str:
     # 맨 앞 @ 제거
     text = re.sub(r'^@+', '', text)
 
+    # 별 제거
+    text = text.replace("⭐", "")
+
     # 공백 제거
     text = re.sub(r'\s+', '', text)
 
     # 특수문자 제거
     text = re.sub(r'[^0-9a-z가-힣]', '', text)
 
-    # 별칭 통합
     alias_map = {
         "우진": "우진",
         "woojin": "우진",
         "ujin": "우진",
+
         "봉식": "봉식",
         "bongsik": "봉식",
-        "bongsik": "봉식",
+
         "alroo": "alroo",
+
+        "호랭": "호랭",
+        "백구": "백구",
     }
 
     return alias_map.get(text, text)
@@ -282,6 +290,9 @@ def score_display_name(name: str) -> int:
         score += 3
 
     if "@" in text:
+        score += 1
+
+    if "⭐" in text:
         score += 1
 
     return score
@@ -304,7 +315,7 @@ def choose_better_display_name(old_name: str, new_name: str) -> str:
 def build_aggregated_rows():
     grouped = {}
 
-    # 1) baseline 먼저 반영
+    # baseline 반영
     for raw_name, base_count in BASELINE_COUNTS.items():
         key = normalize_person_key(raw_name)
         if not key:
@@ -317,7 +328,7 @@ def build_aggregated_rows():
             "last_seen": ""
         }
 
-    # 2) 실제 DB 반영
+    # 실제 DB 유저 반영
     rows = get_all_users()
     for row in rows:
         user_id = str(row["user_id"])
