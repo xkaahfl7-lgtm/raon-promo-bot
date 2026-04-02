@@ -16,14 +16,16 @@ LOG_CHANNEL = 1481661104580067419
 DB_FILE = "promo.db"
 KST = ZoneInfo("Asia/Seoul")
 
+# 시작값
 BASELINE = {
-    "GUIDE🐣ㆍ봉식": 376,
-    "AMㆍ우진": 529,
+    "GUIDE🐣ㆍ봉식": 376,   # 576 - 200
+    "AMㆍ우진": 529,        # 519 + 10
     "STAFFㆍ⭐이민우": 101,
     "STAFFㆍ⭐윤콩": 74,
-    "@alroo💥": 52,
+    "@alroo💥": 52,         # 8 + 44
 }
 
+# 표시명 우선값
 PREFERRED_DISPLAY = {
     "봉식": "GUIDE🐣ㆍ봉식",
     "우진": "AMㆍ우진",
@@ -105,6 +107,11 @@ def is_removed(display_name: str) -> bool:
     return False
 
 
+def get_preferred_display(name: str) -> str:
+    normalized = normalize_name(name)
+    return PREFERRED_DISPLAY.get(normalized, name)
+
+
 def init_db():
     with get_conn() as conn:
         cur = conn.cursor()
@@ -182,11 +189,6 @@ def mark_processed(message_id: str):
             (message_id,)
         )
         conn.commit()
-
-
-def get_preferred_display(name: str) -> str:
-    normalized = normalize_name(name)
-    return PREFERRED_DISPLAY.get(normalized, name)
 
 
 def add_count(user_id: str, display_name: str, count: int):
@@ -269,6 +271,83 @@ def manual_adjust_by_name(name: str, amount: int):
         conn.commit()
 
     return True, preferred_name
+
+
+def set_count_by_name(name: str, amount: int):
+    if is_removed(name):
+        return False, "삭제 대상 유저는 설정할 수 없습니다."
+
+    if amount < 0:
+        return False, "수량은 0 이상만 가능합니다."
+
+    user_id, found_name = find_user_id_by_name(name)
+    preferred_name = get_preferred_display(name)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        if user_id:
+            cur.execute("""
+                UPDATE users
+                SET display_name = ?, count = ?
+                WHERE user_id = ?
+            """, (preferred_name, amount, user_id))
+        else:
+            manual_id = f"manual_{normalize_name(name)}"
+            cur.execute("""
+                INSERT OR REPLACE INTO users (user_id, display_name, count)
+                VALUES (?, ?, ?)
+            """, (manual_id, preferred_name, amount))
+
+        conn.commit()
+
+    return True, preferred_name
+
+
+def rename_user(old_name: str, new_name: str):
+    if is_removed(new_name):
+        return False, "삭제 대상 이름으로 변경할 수 없습니다."
+
+    old_user_id, old_found_name = find_user_id_by_name(old_name)
+    if not old_user_id:
+        return False, "기존 닉네임을 찾지 못했습니다."
+
+    new_preferred = get_preferred_display(new_name)
+    new_key = normalize_name(new_name)
+
+    existing_new_id, existing_new_name = find_user_id_by_name(new_name)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute("SELECT count FROM users WHERE user_id = ?", (old_user_id,))
+        old_row = cur.fetchone()
+        old_count = int(old_row["count"]) if old_row else 0
+
+        if existing_new_id and existing_new_id != old_user_id:
+            cur.execute("SELECT count FROM users WHERE user_id = ?", (existing_new_id,))
+            new_row = cur.fetchone()
+            new_count = int(new_row["count"]) if new_row else 0
+
+            merged = old_count + new_count
+
+            cur.execute("""
+                UPDATE users
+                SET display_name = ?, count = ?
+                WHERE user_id = ?
+            """, (new_preferred, merged, existing_new_id))
+
+            cur.execute("DELETE FROM users WHERE user_id = ?", (old_user_id,))
+        else:
+            cur.execute("""
+                UPDATE users
+                SET display_name = ?
+                WHERE user_id = ?
+            """, (new_preferred, old_user_id))
+
+        conn.commit()
+
+    return True, new_preferred
 
 
 def get_all_users():
@@ -414,13 +493,41 @@ async def subtract_manual(ctx, nickname: str, amount: int):
     await ctx.send(f"✅ {result} 에게서 {amount}회 차감 완료")
 
 
+@bot.command(name="설정")
+@commands.has_permissions(administrator=True)
+async def set_manual(ctx, nickname: str, amount: int):
+    ok, result = set_count_by_name(nickname, amount)
+    if not ok:
+        await ctx.send(result)
+        return
+
+    await send_log(f"수동 설정 | 관리자: {ctx.author.display_name} | 대상: {result} | {amount}회로 설정")
+    await update_board()
+    await ctx.send(f"✅ {result} 수량을 {amount}회로 설정 완료")
+
+
+@bot.command(name="이름변경")
+@commands.has_permissions(administrator=True)
+async def rename_manual(ctx, old_name: str, new_name: str):
+    ok, result = rename_user(old_name, new_name)
+    if not ok:
+        await ctx.send(result)
+        return
+
+    await send_log(f"이름 변경 | 관리자: {ctx.author.display_name} | {old_name} → {result}")
+    await update_board()
+    await ctx.send(f"✅ {old_name} 닉네임을 {result} 으로 변경 완료")
+
+
 @add_manual.error
 @subtract_manual.error
+@set_manual.error
+@rename_manual.error
 async def manual_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("관리자만 사용할 수 있습니다.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("사용법: !추가 닉네임 수량 / !차감 닉네임 수량")
+        await ctx.send("사용법을 다시 확인해주세요.")
     elif isinstance(error, commands.BadArgument):
         await ctx.send("수량은 숫자로 입력해주세요.")
     else:
