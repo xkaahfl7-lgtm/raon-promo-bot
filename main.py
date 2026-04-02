@@ -51,7 +51,7 @@ def normalize_text(text: str) -> str:
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", str(text)).strip().lower()
-    text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)
+    text = re.sub(r"[\u200b-\u200d\ufeff]", "", text)
     return text
 
 
@@ -65,11 +65,11 @@ def normalize_name(name: str) -> str:
     cleaned = cleaned.replace("⭐", "")
     cleaned = cleaned.replace("🐣", "")
     cleaned = cleaned.replace("💥", "")
-    cleaned = re.sub(r'^@+', '', cleaned)
+    cleaned = re.sub(r"^@+", "", cleaned)
 
-    compact = re.sub(r'[\s\-_ㆍ·|/\\()\[\]{}]+', '', cleaned)
-    compact = re.sub(r'^(gm|dgm|am|im|ig|guide|staff|dev|admin|mod)+', '', compact, flags=re.IGNORECASE)
-    compact = re.sub(r'[^0-9a-z가-힣]', '', compact)
+    compact = re.sub(r"[\s\-_ㆍ·|/\\()\[\]{}]+", "", cleaned)
+    compact = re.sub(r"^(gm|dgm|am|im|ig|guide|staff|dev|admin|mod)+", "", compact, flags=re.IGNORECASE)
+    compact = re.sub(r"[^0-9a-z가-힣]", "", compact)
 
     alias_map = {
         "봉식": "봉식",
@@ -351,6 +351,25 @@ def rename_user(old_name: str, new_name: str):
     return True, new_preferred
 
 
+def delete_user_by_name(name: str):
+    target = normalize_name(name)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, display_name FROM users")
+        rows = cur.fetchall()
+
+        deleted = False
+        for row in rows:
+            if normalize_name(row["display_name"]) == target:
+                cur.execute("DELETE FROM users WHERE user_id = ?", (row["user_id"],))
+                deleted = True
+
+        conn.commit()
+
+    return deleted
+
+
 def get_all_users():
     with get_conn() as conn:
         cur = conn.cursor()
@@ -531,10 +550,25 @@ async def rename_manual(ctx, old_name: str, new_name: str):
     await update_board()
 
 
+@bot.command(name="삭제")
+@commands.has_permissions(administrator=True)
+async def delete_user(ctx, nickname: str):
+    await silent_delete_message(ctx.message)
+
+    deleted = delete_user_by_name(nickname)
+
+    if deleted:
+        await send_log(f"유저 삭제 | 관리자: {ctx.author.display_name} | 대상: {nickname}")
+        await update_board()
+    else:
+        await send_log(f"삭제 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 존재하지 않음")
+
+
 @add_manual.error
 @subtract_manual.error
 @set_manual.error
 @rename_manual.error
+@delete_user.error
 async def manual_command_error(ctx, error):
     await silent_delete_message(ctx.message)
 
@@ -591,30 +625,5 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("환경변수 TOKEN 이 비어 있습니다.")
-@bot.command(name="삭제")
-@commands.has_permissions(administrator=True)
-async def delete_user(ctx, nickname: str):
-    await silent_delete_message(ctx.message)
 
-    target = normalize_name(nickname)
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, display_name FROM users")
-        rows = cur.fetchall()
-
-        deleted = False
-
-        for row in rows:
-            if normalize_name(row["display_name"]) == target:
-                cur.execute("DELETE FROM users WHERE user_id = ?", (row["user_id"],))
-                deleted = True
-
-        conn.commit()
-
-    if deleted:
-        await send_log(f"유저 삭제 | 관리자: {ctx.author.display_name} | 대상: {nickname}")
-        await update_board()
-    else:
-        await send_log(f"삭제 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 존재하지 않음")
     bot.run(TOKEN)
