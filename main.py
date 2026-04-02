@@ -17,17 +17,13 @@ DB_FILE = "promo.db"
 KST = ZoneInfo("Asia/Seoul")
 
 # 복구용 시작값
-# 삭제 요청한 사람은 넣지 않음
 BASELINE = {
-    "GUIDE🐣ㆍ봉식": 576,
-    "AMㆍ우진": 519,
+    "GUIDE🐣ㆍ봉식": 376,   # 576 - 200
+    "AMㆍ우진": 529,        # 519 + 10
     "STAFFㆍ⭐이민우": 101,
     "STAFFㆍ⭐윤콩": 74,
-    "@alroo💥": 52,
+    "@alroo💥": 52,         # 8 + 44
 }
-
-# 퇴사/삭제 대상
-REMOVED_KEYS = {"혁이", "호랭", "백구", "old_bongsik"}
 
 # 표시명 우선값
 PREFERRED_DISPLAY = {
@@ -35,8 +31,8 @@ PREFERRED_DISPLAY = {
     "우진": "AMㆍ우진",
     "이민우": "STAFFㆍ⭐이민우",
     "윤콩": "STAFFㆍ⭐윤콩",
-    "알루": "STAFFㆍ⭐알루",
     "alroo": "@alroo💥",
+    "알루": "@alroo💥",
 }
 
 intents = discord.Intents.default()
@@ -67,13 +63,13 @@ def normalize_name(name: str) -> str:
 
     raw = normalize_text(name)
 
-    no_emoji = raw
-    no_emoji = no_emoji.replace("⭐", "")
-    no_emoji = no_emoji.replace("🐣", "")
-    no_emoji = no_emoji.replace("💥", "")
-    no_emoji = re.sub(r'^@+', '', no_emoji)
+    cleaned = raw
+    cleaned = cleaned.replace("⭐", "")
+    cleaned = cleaned.replace("🐣", "")
+    cleaned = cleaned.replace("💥", "")
+    cleaned = re.sub(r'^@+', '', cleaned)
 
-    compact = re.sub(r'[\s\-_ㆍ·|/\\()\[\]{}]+', '', no_emoji)
+    compact = re.sub(r'[\s\-_ㆍ·|/\\()\[\]{}]+', '', cleaned)
     compact = re.sub(r'^(gm|dgm|am|im|ig|guide|staff|dev|admin|mod)+', '', compact, flags=re.IGNORECASE)
     compact = re.sub(r'[^0-9a-z가-힣]', '', compact)
 
@@ -85,8 +81,11 @@ def normalize_name(name: str) -> str:
         "ujin": "우진",
         "이민우": "이민우",
         "윤콩": "윤콩",
-        "알루": "알루",
+        "알루": "alroo",
         "alroo": "alroo",
+        "혁이": "혁이",
+        "호랭": "호랭",
+        "백구": "백구",
     }
 
     return alias_map.get(compact, compact)
@@ -162,8 +161,6 @@ def cleanup_removed_users():
 
         deleted = 0
         for row in rows:
-            if str(row["user_id"]).startswith("baseline_"):
-                continue
             if is_removed(row["display_name"]):
                 cur.execute("DELETE FROM users WHERE user_id = ?", (row["user_id"],))
                 deleted += 1
@@ -198,8 +195,8 @@ def add_count(user_id: str, display_name: str, count: int):
         cur.execute("SELECT count FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
 
-        key = normalize_name(display_name)
-        preferred_name = PREFERRED_DISPLAY.get(key, display_name)
+        normalized = normalize_name(display_name)
+        preferred_name = PREFERRED_DISPLAY.get(normalized, display_name)
 
         if row:
             new_count = int(row["count"]) + int(count)
@@ -228,38 +225,31 @@ def build_rows():
     grouped = {}
 
     for row in get_all_users():
-        user_id = str(row["user_id"])
         display_name = row["display_name"]
         count = int(row["count"])
 
         if is_removed(display_name):
             continue
 
-        if user_id.startswith("baseline_"):
-            group_key = f"baseline::{normalize_name(display_name)}"
-        else:
-            group_key = f"user::{user_id}"
+        normalized = normalize_name(display_name)
+        if not normalized:
+            normalized = display_name
+
+        # 핵심: baseline / 실제 유저 구분 없이 같은 이름이면 하나로 합침
+        group_key = normalized
 
         if group_key not in grouped:
             grouped[group_key] = {
-                "display_name": display_name,
-                "count": 0,
-                "priority_key": normalize_name(display_name)
+                "display_name": PREFERRED_DISPLAY.get(normalized, display_name),
+                "count": 0
             }
 
         grouped[group_key]["count"] += count
 
-        normalized = normalize_name(display_name)
         if normalized in PREFERRED_DISPLAY:
             grouped[group_key]["display_name"] = PREFERRED_DISPLAY[normalized]
 
-    rows = []
-    for _, value in grouped.items():
-        rows.append({
-            "display_name": value["display_name"],
-            "count": value["count"]
-        })
-
+    rows = list(grouped.values())
     rows.sort(key=lambda x: (-x["count"], x["display_name"]))
     return rows
 
