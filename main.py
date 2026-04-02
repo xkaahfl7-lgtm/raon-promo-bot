@@ -591,5 +591,30 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("환경변수 TOKEN 이 비어 있습니다.")
+@bot.command(name="삭제")
+@commands.has_permissions(administrator=True)
+async def delete_user(ctx, nickname: str):
+    await silent_delete_message(ctx.message)
 
+    target = normalize_name(nickname)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, display_name FROM users")
+        rows = cur.fetchall()
+
+        deleted = False
+
+        for row in rows:
+            if normalize_name(row["display_name"]) == target:
+                cur.execute("DELETE FROM users WHERE user_id = ?", (row["user_id"],))
+                deleted = True
+
+        conn.commit()
+
+    if deleted:
+        await send_log(f"유저 삭제 | 관리자: {ctx.author.display_name} | 대상: {nickname}")
+        await update_board()
+    else:
+        await send_log(f"삭제 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 존재하지 않음")
     bot.run(TOKEN)
