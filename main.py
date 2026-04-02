@@ -2,6 +2,8 @@ import discord
 from discord.ext import commands
 import os
 import sqlite3
+import re
+import unicodedata
 from zoneinfo import ZoneInfo
 
 TOKEN = os.getenv("TOKEN")
@@ -14,6 +16,29 @@ LOG_CHANNEL = 1481661104580067419
 DB_FILE = "promo.db"
 KST = ZoneInfo("Asia/Seoul")
 
+# 복구용 시작값
+# 삭제 요청한 사람은 넣지 않음
+BASELINE = {
+    "GUIDE🐣ㆍ봉식": 576,
+    "AMㆍ우진": 519,
+    "STAFFㆍ⭐이민우": 101,
+    "STAFFㆍ⭐윤콩": 74,
+    "@alroo💥": 52,
+}
+
+# 퇴사/삭제 대상
+REMOVED_KEYS = {"혁이", "호랭", "백구", "old_bongsik"}
+
+# 표시명 우선값
+PREFERRED_DISPLAY = {
+    "봉식": "GUIDE🐣ㆍ봉식",
+    "우진": "AMㆍ우진",
+    "이민우": "STAFFㆍ⭐이민우",
+    "윤콩": "STAFFㆍ⭐윤콩",
+    "알루": "STAFFㆍ⭐알루",
+    "alroo": "@alroo💥",
+}
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -21,34 +46,151 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ❌ 제외할 유저 (퇴사자)
-REMOVED = ["혁이", "호랭", "백구"]
 
 def get_conn():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)
+    return text
+
+
+def normalize_name(name: str) -> str:
+    if not name:
+        return ""
+
+    raw = normalize_text(name)
+
+    no_emoji = raw
+    no_emoji = no_emoji.replace("⭐", "")
+    no_emoji = no_emoji.replace("🐣", "")
+    no_emoji = no_emoji.replace("💥", "")
+    no_emoji = re.sub(r'^@+', '', no_emoji)
+
+    compact = re.sub(r'[\s\-_ㆍ·|/\\()\[\]{}]+', '', no_emoji)
+    compact = re.sub(r'^(gm|dgm|am|im|ig|guide|staff|dev|admin|mod)+', '', compact, flags=re.IGNORECASE)
+    compact = re.sub(r'[^0-9a-z가-힣]', '', compact)
+
+    alias_map = {
+        "봉식": "봉식",
+        "bongsik": "봉식",
+        "우진": "우진",
+        "woojin": "우진",
+        "ujin": "우진",
+        "이민우": "이민우",
+        "윤콩": "윤콩",
+        "알루": "알루",
+        "alroo": "alroo",
+    }
+
+    return alias_map.get(compact, compact)
+
+
+def is_old_ig_bongsik(display_name: str) -> bool:
+    if not display_name:
+        return False
+    raw = normalize_text(display_name)
+    return ("봉식" in raw) and ("ig" in raw) and ("guide" not in raw)
+
+
+def is_removed(display_name: str) -> bool:
+    key = normalize_name(display_name)
+    if key in {"혁이", "호랭", "백구"}:
+        return True
+    if is_old_ig_bongsik(display_name):
+        return True
+    return False
+
+
 def init_db():
     with get_conn() as conn:
-        conn.execute("""
+        cur = conn.cursor()
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
-                display_name TEXT,
-                count INTEGER
+                display_name TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS processed (
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_messages (
                 message_id TEXT PRIMARY KEY
             )
         """)
 
-def is_removed(name):
-    return any(x in name for x in REMOVED)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
 
-def add_count(user_id, name, count):
-    if is_removed(name):
+        conn.commit()
+
+        cur.execute("SELECT value FROM meta WHERE key = 'baseline_applied'")
+        row = cur.fetchone()
+
+        if not row:
+            for idx, (name, count) in enumerate(BASELINE.items(), start=1):
+                cur.execute("""
+                    INSERT OR REPLACE INTO users (user_id, display_name, count)
+                    VALUES (?, ?, ?)
+                """, (f"baseline_{idx}", name, count))
+
+            cur.execute("""
+                INSERT OR REPLACE INTO meta (key, value)
+                VALUES ('baseline_applied', 'done')
+            """)
+            conn.commit()
+
+        cleanup_removed_users()
+
+
+def cleanup_removed_users():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, display_name FROM users")
+        rows = cur.fetchall()
+
+        deleted = 0
+        for row in rows:
+            if str(row["user_id"]).startswith("baseline_"):
+                continue
+            if is_removed(row["display_name"]):
+                cur.execute("DELETE FROM users WHERE user_id = ?", (row["user_id"],))
+                deleted += 1
+
+        conn.commit()
+        return deleted
+
+
+def is_processed(message_id: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,))
+        return cur.fetchone() is not None
+
+
+def mark_processed(message_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)",
+            (message_id,)
+        )
+        conn.commit()
+
+
+def add_count(user_id: str, display_name: str, count: int):
+    if is_removed(display_name):
         return
 
     with get_conn() as conn:
@@ -56,108 +198,183 @@ def add_count(user_id, name, count):
         cur.execute("SELECT count FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
 
+        key = normalize_name(display_name)
+        preferred_name = PREFERRED_DISPLAY.get(key, display_name)
+
         if row:
-            conn.execute(
-                "UPDATE users SET display_name=?, count=? WHERE user_id=?",
-                (name, row["count"] + count, user_id)
-            )
+            new_count = int(row["count"]) + int(count)
+            cur.execute("""
+                UPDATE users
+                SET display_name = ?, count = ?
+                WHERE user_id = ?
+            """, (preferred_name, new_count, user_id))
         else:
-            conn.execute(
-                "INSERT INTO users VALUES (?, ?, ?)",
-                (user_id, name, count)
-            )
+            cur.execute("""
+                INSERT INTO users (user_id, display_name, count)
+                VALUES (?, ?, ?)
+            """, (user_id, preferred_name, int(count)))
 
-def get_users():
+        conn.commit()
+
+
+def get_all_users():
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM users").fetchall()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, display_name, count FROM users")
+        return cur.fetchall()
 
-def build_board():
-    users = get_users()
-    users = [u for u in users if not is_removed(u["display_name"])]
-    users.sort(key=lambda x: -x["count"])
 
-    text = "🏆 홍보 랭킹\n\n📊 홍보 횟수\n"
-    for u in users:
-        text += f"{u['display_name']} — {u['count']}회\n"
+def build_rows():
+    grouped = {}
 
-    text += "\n🏆 홍보 랭킹\n"
-    for i, u in enumerate(users[:10], 1):
-        text += f"{i}위 {u['display_name']} — {u['count']}회\n"
+    for row in get_all_users():
+        user_id = str(row["user_id"])
+        display_name = row["display_name"]
+        count = int(row["count"])
 
-    return text[:1900]
+        if is_removed(display_name):
+            continue
+
+        if user_id.startswith("baseline_"):
+            group_key = f"baseline::{normalize_name(display_name)}"
+        else:
+            group_key = f"user::{user_id}"
+
+        if group_key not in grouped:
+            grouped[group_key] = {
+                "display_name": display_name,
+                "count": 0,
+                "priority_key": normalize_name(display_name)
+            }
+
+        grouped[group_key]["count"] += count
+
+        normalized = normalize_name(display_name)
+        if normalized in PREFERRED_DISPLAY:
+            grouped[group_key]["display_name"] = PREFERRED_DISPLAY[normalized]
+
+    rows = []
+    for _, value in grouped.items():
+        rows.append({
+            "display_name": value["display_name"],
+            "count": value["count"]
+        })
+
+    rows.sort(key=lambda x: (-x["count"], x["display_name"]))
+    return rows
+
+
+def build_board_text():
+    rows = build_rows()
+
+    lines = ["🏆 홍보 랭킹", ""]
+
+    if not rows:
+        lines.append("데이터 없음")
+    else:
+        lines.append("📊 홍보 횟수")
+        for row in rows:
+            lines.append(f"{row['display_name']} — {row['count']}회")
+
+        lines.append("")
+        lines.append("🏆 홍보 랭킹")
+        for idx, row in enumerate(rows[:10], start=1):
+            lines.append(f"{idx}위 {row['display_name']} — {row['count']}회")
+
+    return "\n".join(lines)[:1900]
+
+
+async def send_log(text: str):
+    print(text)
+    channel = bot.get_channel(LOG_CHANNEL)
+    if channel:
+        try:
+            await channel.send(text)
+        except Exception as e:
+            print(f"로그 전송 실패: {e}")
+
 
 async def update_board():
     channel = bot.get_channel(RANK_CHANNEL)
     if not channel:
+        await send_log("오류 | 랭킹 채널 없음")
         return
 
-    text = build_board()
+    text = build_board_text()
 
-    async for msg in channel.history(limit=10):
-        if msg.author == bot.user:
-            await msg.edit(content=text)
-            return
+    try:
+        async for msg in channel.history(limit=20):
+            if msg.author == bot.user:
+                await msg.edit(content=text)
+                return
+        await channel.send(text)
+    except Exception as e:
+        await send_log(f"오류 | 랭킹 업데이트 실패 | {e}")
 
-    await channel.send(text)
 
-async def log(msg):
-    print(msg)
-    channel = bot.get_channel(LOG_CHANNEL)
-    if channel:
-        await channel.send(msg)
+def count_images(message: discord.Message) -> int:
+    count = 0
 
-def is_processed(mid):
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT 1 FROM processed WHERE message_id=?",
-            (mid,)
-        ).fetchone()
+    for attachment in message.attachments:
+        filename = attachment.filename.lower()
+        if filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+            count += 1
 
-def mark(mid):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO processed VALUES (?)",
-            (mid,)
-        )
+    for embed in message.embeds:
+        if embed.image or embed.thumbnail:
+            count += 1
 
-def count_images(message):
-    return len([a for a in message.attachments if a.filename.endswith(("png","jpg","jpeg","webp","gif"))])
+    return min(count, 30)
+
 
 @bot.event
 async def on_ready():
     init_db()
-    await log("🤖 홍보봇 실행 완료")
+    removed_count = cleanup_removed_users()
+    await send_log(f"🤖 RAON 홍보봇이 정상적으로 실행되었습니다. | 정리된 삭제 대상: {removed_count}명")
     await update_board()
+    print(f"로그인 완료: {bot.user}")
+
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    if message.guild.id != GUILD_ID:
+    if message.guild is None or message.guild.id != GUILD_ID:
         return
 
     if message.channel.id != PROMO_CHANNEL:
         return
 
-    if is_processed(str(message.id)):
+    message_id = str(message.id)
+    if is_processed(message_id):
         return
 
-    count = count_images(message)
-    if count == 0:
+    image_count = count_images(message)
+    if image_count <= 0:
         return
 
     try:
-        add_count(str(message.author.id), message.author.display_name, count)
-        mark(str(message.id))
+        if is_removed(message.author.display_name):
+            await send_log(f"제외됨 | {message.author.display_name} | 삭제 대상 유저")
+            mark_processed(message_id)
+            return
 
-        await log(f"홍보 +{count} | {message.author.display_name}")
+        add_count(str(message.author.id), message.author.display_name, image_count)
+        mark_processed(message_id)
 
+        await send_log(f"홍보 인증 | {message.author.display_name} (+{image_count})")
         await update_board()
 
     except Exception as e:
-        await log(f"❌ 오류: {e}")
+        await send_log(f"오류 | 홍보 집계 실패 | {message.author.display_name} | {e}")
 
     await bot.process_commands(message)
 
-bot.run(TOKEN)
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise ValueError("환경변수 TOKEN 이 비어 있습니다.")
+
+    bot.run(TOKEN)
