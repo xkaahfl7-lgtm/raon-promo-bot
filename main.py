@@ -16,16 +16,14 @@ LOG_CHANNEL = 1481661104580067419
 DB_FILE = "promo.db"
 KST = ZoneInfo("Asia/Seoul")
 
-# 복구용 시작값
 BASELINE = {
-    "GUIDE🐣ㆍ봉식": 376,   # 576 - 200
-    "AMㆍ우진": 529,        # 519 + 10
+    "GUIDE🐣ㆍ봉식": 376,
+    "AMㆍ우진": 529,
     "STAFFㆍ⭐이민우": 101,
     "STAFFㆍ⭐윤콩": 74,
-    "@alroo💥": 52,         # 8 + 44
+    "@alroo💥": 52,
 }
 
-# 표시명 우선값
 PREFERRED_DISPLAY = {
     "봉식": "GUIDE🐣ㆍ봉식",
     "우진": "AMㆍ우진",
@@ -186,17 +184,21 @@ def mark_processed(message_id: str):
         conn.commit()
 
 
+def get_preferred_display(name: str) -> str:
+    normalized = normalize_name(name)
+    return PREFERRED_DISPLAY.get(normalized, name)
+
+
 def add_count(user_id: str, display_name: str, count: int):
     if is_removed(display_name):
-        return
+        return False
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT count FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
 
-        normalized = normalize_name(display_name)
-        preferred_name = PREFERRED_DISPLAY.get(normalized, display_name)
+        preferred_name = get_preferred_display(display_name)
 
         if row:
             new_count = int(row["count"]) + int(count)
@@ -212,6 +214,61 @@ def add_count(user_id: str, display_name: str, count: int):
             """, (user_id, preferred_name, int(count)))
 
         conn.commit()
+        return True
+
+
+def find_user_id_by_name(name: str):
+    target = normalize_name(name)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, display_name FROM users")
+        rows = cur.fetchall()
+
+    for row in rows:
+        if normalize_name(row["display_name"]) == target:
+            return str(row["user_id"]), row["display_name"]
+
+    return None, None
+
+
+def manual_adjust_by_name(name: str, amount: int):
+    if is_removed(name):
+        return False, "삭제 대상 유저는 추가/차감할 수 없습니다."
+
+    user_id, found_name = find_user_id_by_name(name)
+    preferred_name = get_preferred_display(name)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        if user_id:
+            cur.execute("SELECT count FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            current = int(row["count"]) if row else 0
+            new_count = current + amount
+
+            if new_count < 0:
+                new_count = 0
+
+            cur.execute("""
+                UPDATE users
+                SET display_name = ?, count = ?
+                WHERE user_id = ?
+            """, (preferred_name, new_count, user_id))
+        else:
+            if amount < 0:
+                return False, "없는 유저는 차감할 수 없습니다."
+
+            manual_id = f"manual_{normalize_name(name)}"
+            cur.execute("""
+                INSERT OR REPLACE INTO users (user_id, display_name, count)
+                VALUES (?, ?, ?)
+            """, (manual_id, preferred_name, amount))
+
+        conn.commit()
+
+    return True, preferred_name
 
 
 def get_all_users():
@@ -235,19 +292,16 @@ def build_rows():
         if not normalized:
             normalized = display_name
 
-        # 핵심: baseline / 실제 유저 구분 없이 같은 이름이면 하나로 합침
         group_key = normalized
 
         if group_key not in grouped:
             grouped[group_key] = {
-                "display_name": PREFERRED_DISPLAY.get(normalized, display_name),
+                "display_name": get_preferred_display(display_name),
                 "count": 0
             }
 
         grouped[group_key]["count"] += count
-
-        if normalized in PREFERRED_DISPLAY:
-            grouped[group_key]["display_name"] = PREFERRED_DISPLAY[normalized]
+        grouped[group_key]["display_name"] = get_preferred_display(display_name)
 
     rows = list(grouped.values())
     rows.sort(key=lambda x: (-x["count"], x["display_name"]))
@@ -326,10 +380,60 @@ async def on_ready():
     print(f"로그인 완료: {bot.user}")
 
 
+@bot.command(name="추가")
+@commands.has_permissions(administrator=True)
+async def add_manual(ctx, nickname: str, amount: int):
+    if amount <= 0:
+        await ctx.send("수량은 1 이상만 가능합니다.")
+        return
+
+    ok, result = manual_adjust_by_name(nickname, amount)
+    if not ok:
+        await ctx.send(result)
+        return
+
+    await send_log(f"수동 추가 | 관리자: {ctx.author.display_name} | 대상: {result} | +{amount}")
+    await update_board()
+    await ctx.send(f"✅ {result} 에게 {amount}회 추가 완료")
+
+
+@bot.command(name="차감")
+@commands.has_permissions(administrator=True)
+async def subtract_manual(ctx, nickname: str, amount: int):
+    if amount <= 0:
+        await ctx.send("수량은 1 이상만 가능합니다.")
+        return
+
+    ok, result = manual_adjust_by_name(nickname, -amount)
+    if not ok:
+        await ctx.send(result)
+        return
+
+    await send_log(f"수동 차감 | 관리자: {ctx.author.display_name} | 대상: {result} | -{amount}")
+    await update_board()
+    await ctx.send(f"✅ {result} 에게서 {amount}회 차감 완료")
+
+
+@add_manual.error
+@subtract_manual.error
+async def manual_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("관리자만 사용할 수 있습니다.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("사용법: !추가 닉네임 수량 / !차감 닉네임 수량")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("수량은 숫자로 입력해주세요.")
+    else:
+        await send_log(f"명령어 오류 | {type(error).__name__} | {error}")
+        await ctx.send("명령어 처리 중 오류가 발생했습니다.")
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    await bot.process_commands(message)
 
     if message.guild is None or message.guild.id != GUILD_ID:
         return
@@ -351,16 +455,14 @@ async def on_message(message: discord.Message):
             mark_processed(message_id)
             return
 
-        add_count(str(message.author.id), message.author.display_name, image_count)
-        mark_processed(message_id)
-
-        await send_log(f"홍보 인증 | {message.author.display_name} (+{image_count})")
-        await update_board()
+        success = add_count(str(message.author.id), message.author.display_name, image_count)
+        if success:
+            mark_processed(message_id)
+            await send_log(f"홍보 인증 | {message.author.display_name} (+{image_count})")
+            await update_board()
 
     except Exception as e:
         await send_log(f"오류 | 홍보 집계 실패 | {message.author.display_name} | {e}")
-
-    await bot.process_commands(message)
 
 
 if __name__ == "__main__":
