@@ -16,16 +16,14 @@ LOG_CHANNEL = 1481661104580067419
 DB_FILE = "promo.db"
 KST = ZoneInfo("Asia/Seoul")
 
-# 시작값
 BASELINE = {
-    "GUIDE🐣ㆍ봉식": 376,   # 576 - 200
-    "AMㆍ우진": 529,        # 519 + 10
+    "GUIDE🐣ㆍ봉식": 376,
+    "AMㆍ우진": 529,
     "STAFFㆍ⭐이민우": 101,
     "STAFFㆍ⭐윤콩": 74,
-    "@alroo💥": 52,         # 8 + 44
+    "@alroo💥": 52,
 }
 
-# 표시명 우선값
 PREFERRED_DISPLAY = {
     "봉식": "GUIDE🐣ㆍ봉식",
     "우진": "AMㆍ우진",
@@ -204,16 +202,21 @@ def add_count(user_id: str, display_name: str, count: int):
 
         if row:
             new_count = int(row["count"]) + int(count)
+            if new_count < 0:
+                new_count = 0
             cur.execute("""
                 UPDATE users
                 SET display_name = ?, count = ?
                 WHERE user_id = ?
             """, (preferred_name, new_count, user_id))
         else:
+            start_count = int(count)
+            if start_count < 0:
+                start_count = 0
             cur.execute("""
                 INSERT INTO users (user_id, display_name, count)
                 VALUES (?, ?, ?)
-            """, (user_id, preferred_name, int(count)))
+            """, (user_id, preferred_name, start_count))
 
         conn.commit()
         return True
@@ -238,7 +241,7 @@ def manual_adjust_by_name(name: str, amount: int):
     if is_removed(name):
         return False, "삭제 대상 유저는 추가/차감할 수 없습니다."
 
-    user_id, found_name = find_user_id_by_name(name)
+    user_id, _ = find_user_id_by_name(name)
     preferred_name = get_preferred_display(name)
 
     with get_conn() as conn:
@@ -280,7 +283,7 @@ def set_count_by_name(name: str, amount: int):
     if amount < 0:
         return False, "수량은 0 이상만 가능합니다."
 
-    user_id, found_name = find_user_id_by_name(name)
+    user_id, _ = find_user_id_by_name(name)
     preferred_name = get_preferred_display(name)
 
     with get_conn() as conn:
@@ -308,14 +311,12 @@ def rename_user(old_name: str, new_name: str):
     if is_removed(new_name):
         return False, "삭제 대상 이름으로 변경할 수 없습니다."
 
-    old_user_id, old_found_name = find_user_id_by_name(old_name)
+    old_user_id, _ = find_user_id_by_name(old_name)
     if not old_user_id:
         return False, "기존 닉네임을 찾지 못했습니다."
 
     new_preferred = get_preferred_display(new_name)
-    new_key = normalize_name(new_name)
-
-    existing_new_id, existing_new_name = find_user_id_by_name(new_name)
+    existing_new_id, _ = find_user_id_by_name(new_name)
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -400,7 +401,7 @@ def build_board_text():
             lines.append(f"{row['display_name']} — {row['count']}회")
 
         lines.append("")
-        lines.append("🏆 홍보 랭킹")
+        lines.append("🏆 TOP 10")
         for idx, row in enumerate(rows[:10], start=1):
             lines.append(f"{idx}위 {row['display_name']} — {row['count']}회")
 
@@ -450,6 +451,13 @@ def count_images(message: discord.Message) -> int:
     return min(count, 30)
 
 
+async def silent_delete_message(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 @bot.event
 async def on_ready():
     init_db()
@@ -462,61 +470,65 @@ async def on_ready():
 @bot.command(name="추가")
 @commands.has_permissions(administrator=True)
 async def add_manual(ctx, nickname: str, amount: int):
+    await silent_delete_message(ctx.message)
+
     if amount <= 0:
-        await ctx.send("수량은 1 이상만 가능합니다.")
+        await send_log(f"수동 추가 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 잘못된 수량: {amount}")
         return
 
     ok, result = manual_adjust_by_name(nickname, amount)
     if not ok:
-        await ctx.send(result)
+        await send_log(f"수동 추가 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 사유: {result}")
         return
 
     await send_log(f"수동 추가 | 관리자: {ctx.author.display_name} | 대상: {result} | +{amount}")
     await update_board()
-    await ctx.send(f"✅ {result} 에게 {amount}회 추가 완료")
 
 
 @bot.command(name="차감")
 @commands.has_permissions(administrator=True)
 async def subtract_manual(ctx, nickname: str, amount: int):
+    await silent_delete_message(ctx.message)
+
     if amount <= 0:
-        await ctx.send("수량은 1 이상만 가능합니다.")
+        await send_log(f"수동 차감 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 잘못된 수량: {amount}")
         return
 
     ok, result = manual_adjust_by_name(nickname, -amount)
     if not ok:
-        await ctx.send(result)
+        await send_log(f"수동 차감 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 사유: {result}")
         return
 
     await send_log(f"수동 차감 | 관리자: {ctx.author.display_name} | 대상: {result} | -{amount}")
     await update_board()
-    await ctx.send(f"✅ {result} 에게서 {amount}회 차감 완료")
 
 
 @bot.command(name="설정")
 @commands.has_permissions(administrator=True)
 async def set_manual(ctx, nickname: str, amount: int):
+    await silent_delete_message(ctx.message)
+
     ok, result = set_count_by_name(nickname, amount)
     if not ok:
-        await ctx.send(result)
+        await send_log(f"수동 설정 실패 | 관리자: {ctx.author.display_name} | 대상: {nickname} | 사유: {result}")
         return
 
     await send_log(f"수동 설정 | 관리자: {ctx.author.display_name} | 대상: {result} | {amount}회로 설정")
     await update_board()
-    await ctx.send(f"✅ {result} 수량을 {amount}회로 설정 완료")
 
 
 @bot.command(name="이름변경")
 @commands.has_permissions(administrator=True)
 async def rename_manual(ctx, old_name: str, new_name: str):
+    await silent_delete_message(ctx.message)
+
     ok, result = rename_user(old_name, new_name)
     if not ok:
-        await ctx.send(result)
+        await send_log(f"이름 변경 실패 | 관리자: {ctx.author.display_name} | {old_name} -> {new_name} | 사유: {result}")
         return
 
-    await send_log(f"이름 변경 | 관리자: {ctx.author.display_name} | {old_name} → {result}")
+    await send_log(f"이름 변경 | 관리자: {ctx.author.display_name} | {old_name} -> {result}")
     await update_board()
-    await ctx.send(f"✅ {old_name} 닉네임을 {result} 으로 변경 완료")
 
 
 @add_manual.error
@@ -524,15 +536,16 @@ async def rename_manual(ctx, old_name: str, new_name: str):
 @set_manual.error
 @rename_manual.error
 async def manual_command_error(ctx, error):
+    await silent_delete_message(ctx.message)
+
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("관리자만 사용할 수 있습니다.")
+        await send_log(f"명령어 오류 | 권한 없음 | 사용자: {ctx.author.display_name}")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("사용법을 다시 확인해주세요.")
+        await send_log(f"명령어 오류 | 인자 부족 | 사용자: {ctx.author.display_name} | 내용: {ctx.message.content}")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("수량은 숫자로 입력해주세요.")
+        await send_log(f"명령어 오류 | 잘못된 인자 | 사용자: {ctx.author.display_name} | 내용: {ctx.message.content}")
     else:
-        await send_log(f"명령어 오류 | {type(error).__name__} | {error}")
-        await ctx.send("명령어 처리 중 오류가 발생했습니다.")
+        await send_log(f"명령어 오류 | {type(error).__name__} | 사용자: {ctx.author.display_name} | {error}")
 
 
 @bot.event
@@ -546,6 +559,9 @@ async def on_message(message: discord.Message):
         return
 
     if message.channel.id != PROMO_CHANNEL:
+        return
+
+    if message.content.startswith("!"):
         return
 
     message_id = str(message.id)
