@@ -3,9 +3,9 @@ from discord.ext import commands
 import json
 import os
 
-TOKEN = "여기에_봇토큰"
-PROMO_CHANNEL_ID = 1465360797311172730  # 홍보-인증 채널
-LOG_CHANNEL_ID = 1481661104580067419    # 홍보-로그 채널
+TOKEN = os.getenv("TOKEN")
+PROMO_CHANNEL_ID = 1465360797311172730   # 홍보-인증 채널
+LOG_CHANNEL_ID = 1481661104580067419     # 홍보-로그 채널
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -14,21 +14,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 DATA_FILE = "promo_data.json"
 
-# 데이터 불러오기
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
 
-# 데이터 저장
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 @bot.event
 async def on_ready():
-    print(f"🤖 봇 실행 완료: {bot.user}")
+    print(f"🤖 홍보봇 실행 완료: {bot.user}")
 
 @bot.event
 async def on_message(message):
@@ -36,10 +37,21 @@ async def on_message(message):
         return
 
     if message.channel.id != PROMO_CHANNEL_ID:
+        await bot.process_commands(message)
         return
 
-    # 이미지 없으면 무시
     if not message.attachments:
+        await bot.process_commands(message)
+        return
+
+    image_count = 0
+    for attachment in message.attachments:
+        name = attachment.filename.lower()
+        if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            image_count += 1
+
+    if image_count == 0:
+        await bot.process_commands(message)
         return
 
     data = load_data()
@@ -47,37 +59,40 @@ async def on_message(message):
 
     if user_id not in data:
         data[user_id] = {
-            "name": message.author.name,
+            "name": message.author.display_name,
             "count": 0
         }
 
-    data[user_id]["count"] += 1
+    data[user_id]["name"] = message.author.display_name
+    data[user_id]["count"] += image_count
     save_data(data)
 
-    # 로그 전송
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
     if log_channel:
         embed = discord.Embed(
             title="📢 홍보 인증 로그",
-            description=f"{message.author.mention} 님이 홍보 인증을 했습니다!",
             color=0x00ff00
         )
-        embed.add_field(name="누적 횟수", value=f"{data[user_id]['count']}회", inline=False)
+        embed.add_field(name="인증자", value=message.author.mention, inline=False)
+        embed.add_field(name="이번 인증 수", value=f"{image_count}회", inline=True)
+        embed.add_field(name="누적 횟수", value=f"{data[user_id]['count']}회", inline=True)
+        embed.add_field(name="채널", value=message.channel.mention, inline=False)
         await log_channel.send(embed=embed)
 
     await bot.process_commands(message)
 
-# 랭킹 명령어
 @bot.command()
 async def 홍보랭킹(ctx):
     data = load_data()
-
     sorted_users = sorted(data.items(), key=lambda x: x[1]["count"], reverse=True)
 
     msg = "🏆 홍보 랭킹\n\n"
-    for i, (uid, info) in enumerate(sorted_users[:10], start=1):
+    for i, (_, info) in enumerate(sorted_users[:10], start=1):
         msg += f"{i}위 - {info['name']} : {info['count']}회\n"
 
     await ctx.send(msg)
+
+if not TOKEN:
+    raise ValueError("TOKEN 환경변수가 비어 있습니다.")
 
 bot.run(TOKEN)
