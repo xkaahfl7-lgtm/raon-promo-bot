@@ -4,8 +4,8 @@ import json
 import os
 
 TOKEN = "여기에_봇토큰"
-PROMO_CHANNEL_ID = 1234567890  # 홍보-인증 채널
-LOG_CHANNEL_ID = 1234567890    # 홍보-로그 채널
+PROMO_CHANNEL_ID = 1465360797311172730  # 홍보-인증 채널
+LOG_CHANNEL_ID = 1481661104580067419    # 홍보-로그 채널
 
 intents = discord.Intents.default()
 intents.message_content = True
