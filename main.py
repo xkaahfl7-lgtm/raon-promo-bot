@@ -182,11 +182,6 @@ def normalize_name(name: str) -> str:
 
 
 def extract_real_name(name: str) -> str:
-    """
-    STAFFᆞ이민우 -> 이민우
-    STAFFᆞ리더⭐이민우 -> 리더⭐이민우
-    GUIDE🐣ㆍ봉식 -> 봉식
-    """
     if not name:
         return ""
     fixed = str(name).replace("ㆍ", "ᆞ").replace("·", "ᆞ").replace("•", "ᆞ")
@@ -196,12 +191,6 @@ def extract_real_name(name: str) -> str:
 
 
 def canonical_person_name(name: str) -> str:
-    """
-    매칭용 실제 이름 정규화
-    - STAFFᆞ이민우 -> 이민우
-    - STAFFᆞ리더⭐이민우 -> 이민우
-    - 리더ᆞSTAFFᆞ이민우 -> 이민우
-    """
     base = extract_real_name(name)
     text = normalize_name(base)
     text = re.sub(r"[^0-9a-z가-힣]", "", text)
@@ -294,26 +283,22 @@ def find_user_by_display_name(name: str) -> Optional[Tuple[str, Dict[str, Any]]]
     target_canonical = canonical_person_name(name)
     target_normalized = normalize_name(name)
 
-    # 1. 실제 사람 이름 기준
     for uid, user in attendance_data["users"].items():
         display_name = str(user.get("display_name", ""))
         if canonical_person_name(display_name) == target_canonical and target_canonical:
             return uid, user
 
-    # 2. 전체 문자열 기준 완전일치
     for uid, user in attendance_data["users"].items():
         display_name = str(user.get("display_name", ""))
         if normalize_name(display_name) == target_normalized:
             return uid, user
 
-    # 3. 이름 기준 부분일치
     for uid, user in attendance_data["users"].items():
         display_name = str(user.get("display_name", ""))
         current = canonical_person_name(display_name)
         if target_canonical and target_canonical in current:
             return uid, user
 
-    # 4. 전체 문자열 기준 부분일치
     for uid, user in attendance_data["users"].items():
         display_name = str(user.get("display_name", ""))
         if target_normalized and target_normalized in normalize_name(display_name):
@@ -1199,8 +1184,10 @@ async def sync_commands():
     try:
         synced = await bot.tree.sync(guild=GUILD_OBJ)
         await send_log(f"✅ 슬래시 명령어 동기화 완료: {len(synced)}개")
+        print(f"[DEBUG] 슬래시 명령어 동기화 완료: {len(synced)}개")
     except Exception as e:
         await send_log(f"❌ 슬래시 명령어 동기화 실패: {type(e).__name__} / {e}")
+        print(f"[DEBUG] 슬래시 명령어 동기화 실패: {type(e).__name__} / {e}")
 
 
 @bot.event
@@ -1212,9 +1199,14 @@ async def setup_hook():
 @bot.event
 async def on_ready():
     global attendance_data
+
+    print("[DEBUG] on_ready 진입")
     attendance_data = load_data()
+    print("[DEBUG] load_data 완료")
 
     guild = bot.get_guild(GUILD_ID)
+    print(f"[DEBUG] guild 확인: {guild}")
+
     if guild is None:
         print("지정한 GUILD_ID의 서버를 찾지 못했습니다.")
         return
@@ -1222,13 +1214,20 @@ async def on_ready():
     async with data_lock:
         cleanup_invalid_working_states()
         save_data(attendance_data)
+    print("[DEBUG] 데이터 정리 완료")
 
     await rebuild_messages(guild)
+    print("[DEBUG] rebuild_messages 완료")
+
     await refresh_status_message(guild)
+    print("[DEBUG] refresh_status_message 완료")
+
     await sync_commands()
+    print("[DEBUG] sync_commands 완료")
 
     if not auto_status_updater.is_running():
         auto_status_updater.start()
+    print("[DEBUG] auto_status_updater 시작 완료")
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
     await send_log("🤖 RAON 출퇴근 봇이 정상적으로 실행되었습니다.")
